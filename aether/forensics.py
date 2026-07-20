@@ -1,21 +1,23 @@
 """
-AETHER Forensics — classical DSP comparison of two sounds / voice clips.
+AETHER Forensics — classical DSP comparison of two (or many) sounds / speech clips.
 
 Produces:
   - Overall match score 0–100%
-  - Per-dimension scores (timbre, pitch, spectral, envelope, rhythm/energy)
-  - A written, rule-based analysis report (no AI / no LLM)
+  - Reliability 0–100% (how trustworthy the test conditions are)
+  - Per-dimension scores + written report
+  - 1-vs-N ranking (reference vs many candidates)
 
-IMPORTANT LIMITATIONS (always disclosed in the report):
-  - This is NOT court-grade speaker identification.
-  - Not biometric authentication.
-  - Classical features only (MFCC, pitch stats, spectral shape, envelope, etc.).
-  - Same mic/room/codec can inflate similarity; different conditions can deflate it.
+Works on ordinary speech (tale), singing, and general audio — Voice mode
+optimises weights for speech-like material.
+
+IMPORTANT LIMITATIONS (always disclosed):
+  - NOT court-grade speaker identification / biometrics.
+  - Same words not required; different text compares *voice colour*, not content.
+  - Mic/room/codec strongly affect scores.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import librosa
@@ -35,16 +37,184 @@ from aether.loader import load_audio
 from aether.similarity import dtw_mfcc_distance
 
 
-# Default weights for overall score (sum ≈ 1.0)
 DEFAULT_WEIGHTS = {
     "timbre_mfcc": 0.32,
     "pitch": 0.22,
     "spectral": 0.20,
     "envelope": 0.12,
     "energy_dynamics": 0.08,
-    "temporal_align": 0.06,  # DTW on MFCC
+    "temporal_align": 0.06,
 }
 
+VOICE_WEIGHTS = {
+    "timbre_mfcc": 0.36,
+    "pitch": 0.28,
+    "spectral": 0.14,
+    "envelope": 0.08,
+    "energy_dynamics": 0.06,
+    "temporal_align": 0.08,
+}
+
+
+# ---------------------------------------------------------------------------
+# Preprocess (trim region, normalize, speech-oriented cleanup)
+# ---------------------------------------------------------------------------
+
+def preprocess_audio(
+    y: np.ndarray,
+    sr: int,
+    *,
+    start_sec: float = 0.0,
+    end_sec: Optional[float] = None,
+    peak_normalize: bool = True,
+    rms_normalize: bool = True,
+    target_rms: float = 0.1,
+    trim_silence: bool = True,
+    highpass_hz: float = 0.0,
+    max_seconds: float = 45.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Prepare a clip for fair comparison. Returns (y_out, meta).
+    """
+    y = np.asarray(y, dtype=np.float32).ravel()
+    if y.size == 0:
+        raise ValueError("Empty audio")
+
+    n = len(y)
+    i0 = max(0, int(start_sec * sr))
+    i1 = n if end_sec is None else min(n, int(end_sec * sr))
+    if i1 <= i0:
+        raise ValueError("Invalid region: end must be after start")
+    y = y[i0:i1]
+
+    meta: dict[str, Any] = {
+        "region_start": round(i0 / sr, 3),
+        "region_end": round(i1 / sr, 3),
+        "raw_duration": round((i1 - i0) / sr, 3),
+    }
+
+    if highpass_hz and highpass_hz > 0:
+        try:
+            from scipy.signal import butter, filtfilt
+
+            nyq = sr / 2.0
+            wn = min(highpass_hz / nyq, 0.99)
+            if 0 < wn < 1:
+                b, a = butter(2, wn, btype="high")
+                y = filtfilt(b, a, y).astype(np.float32)
+                meta["highpass_hz"] = highpass_hz
+        except Exception:
+            meta["highpass_hz"] = None
+
+    if trim_silence:
+        try:
+            yt, idx = librosa.effects.trim(y, top_db=32.0)
+            if yt.size > int(0.15 * sr):
+                y = yt
+                meta["silence_trim"] = True
+        except Exception:
+            meta["silence_trim"] = False
+
+    if len(y) > int(max_seconds * sr):
+        y = y[: int(max_seconds * sr)]
+        meta["capped_seconds"] = max_seconds
+
+    if peak_normalize:
+        peak = float(np.max(np.abs(y))) + 1e-12
+        y = y / peak
+        meta["peak_normalize"] = True
+
+    if rms_normalize:
+        rms = float(np.sqrt(np.mean(y ** 2)) + 1e-12)
+        y = y * (target_rms / rms)
+        # soft clip
+        y = np.clip(y, -1.0, 1.0).astype(np.float32)
+        meta["rms_normalize"] = True
+        meta["target_rms"] = target_rms
+
+    meta["final_duration"] = round(len(y) / sr, 3)
+    meta["n_samples"] = int(len(y))
+    return y.astype(np.float32), meta
+
+
+def estimate_reliability(
+    profile_a: dict[str, Any],
+    profile_b: dict[str, Any],
+    *,
+    preprocess_a: Optional[dict] = None,
+    preprocess_b: Optional[dict] = None,
+) -> dict[str, Any]:
+    """
+    How trustworthy is this comparison given clip quality / length?
+    Independent of match score — short/noisy clips → low reliability.
+    """
+    reasons: list[str] = []
+    score = 1.0
+
+    da = _safe(profile_a.get("duration"), 0.0)
+    db = _safe(profile_b.get("duration"), 0.0)
+    dmin = min(da, db)
+
+    if dmin < 1.0:
+        score *= 0.35
+        reasons.append(f"Very short clip(s) ({dmin:.1f}s) — scores unstable.")
+    elif dmin < 2.0:
+        score *= 0.55
+        reasons.append(f"Short clip(s) ({dmin:.1f}s) — prefer ≥2–3s of speech.")
+    elif dmin < 3.0:
+        score *= 0.75
+        reasons.append("Clip length OK but thin; ≥3–5s is better for speech.")
+    else:
+        reasons.append(f"Length OK (shortest clip {dmin:.1f}s).")
+
+    # Pitch stability / presence (speech should have some voicing)
+    va = _safe(profile_a.get("voiced_ratio"))
+    vb = _safe(profile_b.get("voiced_ratio"))
+    if va < 0.15 or vb < 0.15:
+        score *= 0.7
+        reasons.append("Low voicing proxy — music, noise, or whisper may dominate.")
+    elif min(va, vb) >= 0.35:
+        reasons.append("Voicing present in both clips.")
+
+    # Extreme flatness → noisy / not speech-like
+    fa = _safe(profile_a.get("spectral_flatness"))
+    fb = _safe(profile_b.get("spectral_flatness"))
+    if fa > 0.35 or fb > 0.35:
+        score *= 0.75
+        reasons.append("High spectral flatness (noisy / wideband) reduces confidence.")
+
+    # Duration mismatch
+    if da > 0 and db > 0:
+        ratio = max(da, db) / min(da, db)
+        if ratio > 4:
+            score *= 0.8
+            reasons.append("Very different lengths — comparing unequal amounts of material.")
+
+    # Pitch missing on both
+    if not profile_a.get("pitch_hz") and not profile_b.get("pitch_hz"):
+        score *= 0.85
+        reasons.append("No stable pitch detected — unpitched material or heavy processing.")
+
+    pct = round(100.0 * float(np.clip(score, 0.05, 1.0)), 1)
+    if pct >= 75:
+        label = "High — conditions look reasonable for a rough acoustic compare"
+    elif pct >= 50:
+        label = "Medium — usable with caution"
+    elif pct >= 30:
+        label = "Low — treat the match % as a weak hint only"
+    else:
+        label = "Very low — re-record longer/cleaner clips if possible"
+
+    return {
+        "reliability_pct": pct,
+        "label": label,
+        "reasons": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Math helpers
+# ---------------------------------------------------------------------------
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=float).ravel()
@@ -56,12 +226,10 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _sim_from_cosine(c: float) -> float:
-    """Map cosine [-1,1] → [0,1]."""
     return float(np.clip((c + 1.0) / 2.0, 0.0, 1.0))
 
 
 def _sim_from_rel_diff(a: float, b: float, scale: float) -> float:
-    """1 when equal; decays with relative absolute difference / scale."""
     if scale <= 0:
         return 0.0
     return float(np.clip(np.exp(-abs(a - b) / scale), 0.0, 1.0))
@@ -79,35 +247,41 @@ def _safe(v: Any, default: float = 0.0) -> float:
         return default
 
 
+# ---------------------------------------------------------------------------
+# Profile extraction
+# ---------------------------------------------------------------------------
+
 def extract_forensic_profile(
     y: np.ndarray,
     sr: int,
     settings: Optional[AnalysisSettings] = None,
     label: str = "sample",
-    max_seconds: float = 30.0,
+    max_seconds: float = 45.0,
+    *,
+    mode: str = "sound",
+    already_preprocessed: bool = False,
+    preprocess_meta: Optional[dict] = None,
 ) -> dict[str, Any]:
-    """
-    Build a forensic feature profile from a mono waveform.
-    Caps length for speed; peak-normalizes.
-    """
+    """Build forensic feature profile from mono waveform."""
     settings = settings or AnalysisSettings()
     y = np.asarray(y, dtype=np.float32).ravel()
     if y.size == 0:
         raise ValueError(f"Empty audio for '{label}'")
 
-    # Trim silence lightly
-    try:
-        yt, _ = librosa.effects.trim(y, top_db=35.0)
-        if yt.size > int(0.1 * sr):
-            y = yt
-    except Exception:
-        pass
+    if not already_preprocessed:
+        y, preprocess_meta = preprocess_audio(
+            y,
+            sr,
+            peak_normalize=True,
+            rms_normalize=True,
+            trim_silence=True,
+            highpass_hz=80.0 if mode == "voice" else 0.0,
+            max_seconds=max_seconds,
+        )
+    preprocess_meta = preprocess_meta or {}
 
-    if len(y) > int(max_seconds * sr):
-        y = y[: int(max_seconds * sr)]
-
-    peak = float(np.max(np.abs(y))) + 1e-12
-    y = y / peak
+    # Pitch range: speech-friendly in voice mode
+    fmin, fmax = (70.0, 450.0) if mode == "voice" else (50.0, 2000.0)
 
     spectral = extract_spectral(y, sr, n_fft=settings.n_fft, hop_length=settings.hop_length)
     mfcc = extract_mfcc(
@@ -116,9 +290,8 @@ def extract_forensic_profile(
     envelope = extract_envelope(y, sr)
     effects = estimate_effects(y, sr, n_fft=settings.n_fft, hop_length=settings.hop_length)
     flux = extract_spectral_flux(y, sr, n_fft=settings.n_fft, hop_length=settings.hop_length)
-    pitch_hz, contour, note = extract_pitch(y, sr, fmin=50.0, fmax=500.0)
+    pitch_hz, contour, note = extract_pitch(y, sr, fmin=fmin, fmax=fmax)
 
-    # Pitch statistics from contour / yin
     pitch_vals = [p for p in contour if p and p > 0]
     if pitch_hz and pitch_hz > 0 and not pitch_vals:
         pitch_vals = [pitch_hz]
@@ -133,23 +306,31 @@ def extract_forensic_profile(
     else:
         pitch_mean = pitch_std = pitch_min = pitch_max = pitch_range = 0.0
 
-    # Full MFCC matrix for DTW
+    # Downsample contour for UI plots (time axis in seconds)
+    hop_pitch = max(1, len(contour) // 128) if contour else 1
+    pitch_times = []
+    pitch_plot = []
+    if contour:
+        # yin hop ≈ frame length; approximate with librosa default spacing
+        # Use linspace over duration for display
+        dur = len(y) / sr
+        n_c = len(contour)
+        for i in range(0, n_c, max(1, n_c // 128)):
+            pitch_times.append(round(dur * i / max(n_c - 1, 1), 3))
+            pitch_plot.append(round(float(contour[i]), 2) if contour[i] and contour[i] > 0 else None)
+
     n_fft_use = min(settings.n_fft, max(256, 2 ** int(np.floor(np.log2(max(len(y), 4))))))
     hop = min(settings.hop_length, max(n_fft_use // 4, 64))
     mfcc_mat = librosa.feature.mfcc(
         y=y, sr=sr, n_mfcc=settings.n_mfcc, n_fft=n_fft_use, hop_length=hop
     ).T
 
-    # Energy dynamics
     rms = librosa.feature.rms(y=y, hop_length=hop)[0]
     rms_mean = float(np.mean(rms)) if rms.size else 0.0
     rms_std = float(np.std(rms)) if rms.size else 0.0
     rms_cv = float(rms_std / (rms_mean + 1e-12))
-
-    # Zero-crossing rate (voice / noise cue)
     zcr = float(np.mean(librosa.feature.zero_crossing_rate(y, hop_length=hop)))
 
-    # Rough spectral envelope (log-mel mean) for “voice colour”
     try:
         mel = librosa.feature.melspectrogram(
             y=y, sr=sr, n_fft=n_fft_use, hop_length=hop, n_mels=40
@@ -159,15 +340,18 @@ def extract_forensic_profile(
     except Exception:
         mel_mean = [0.0] * 40
 
-    # Voicing proxy: harmonic-ish if low flatness + has pitch
     flat = _safe(spectral.get("spectral_flatness"))
     voiced_ratio = 0.0
-    if pitch_vals:
+    if pitch_vals and contour:
         voiced_ratio = float(np.clip(len(pitch_vals) / max(len(contour), 1), 0.0, 1.0))
-    if flat < 0.1 and pitch_mean > 0:
-        voiced_ratio = max(voiced_ratio, 0.55)
+    if flat < 0.12 and pitch_mean > 0:
+        voiced_ratio = max(voiced_ratio, 0.5)
 
     duration = float(len(y) / sr)
+
+    # Keep waveform for viz (cap for memory)
+    max_plot = int(min(len(y), 15 * sr))
+    y_plot = y[:max_plot].copy()
 
     return {
         "label": label,
@@ -178,6 +362,8 @@ def extract_forensic_profile(
         "pitch_min": round(pitch_min, 2),
         "pitch_max": round(pitch_max, 2),
         "pitch_range": round(pitch_range, 2),
+        "pitch_times": pitch_times,
+        "pitch_contour_plot": pitch_plot,
         "note": note,
         "zcr": round(zcr, 5),
         "rms_mean": round(rms_mean, 5),
@@ -187,6 +373,8 @@ def extract_forensic_profile(
         "voiced_ratio": round(voiced_ratio, 3),
         "mel_mean": mel_mean,
         "mfcc_matrix": mfcc_mat.astype(np.float32),
+        "y_plot": y_plot,
+        "preprocess": preprocess_meta,
         **spectral,
         **mfcc,
         **envelope,
@@ -198,13 +386,18 @@ def extract_forensic_profile_from_path(
     path: str,
     settings: Optional[AnalysisSettings] = None,
     label: Optional[str] = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     settings = settings or AnalysisSettings()
     y, sr, meta = load_audio(path, settings=settings)
     return extract_forensic_profile(
-        y, sr, settings=settings, label=label or meta.get("filename") or path
+        y, sr, settings=settings, label=label or meta.get("filename") or path, **kwargs
     )
 
+
+# ---------------------------------------------------------------------------
+# Dimension scores
+# ---------------------------------------------------------------------------
 
 def _timbre_score(a: dict, b: dict) -> float:
     va = np.concatenate(
@@ -227,22 +420,38 @@ def _timbre_score(a: dict, b: dict) -> float:
 def _pitch_score(a: dict, b: dict) -> float:
     pa, pb = a.get("pitch_hz"), b.get("pitch_hz")
     if not pa or not pb or pa <= 0 or pb <= 0:
-        # Both unpitched → neutral-high if both lack pitch; else low
         if (not pa or pa <= 0) and (not pb or pb <= 0):
-            return 0.65  # both noise/unpitched-ish
+            return 0.65
         return 0.25
 
-    # Compare in cents (musical distance)
     cents = 1200.0 * abs(np.log2(pa / pb))
-    mean_sim = float(np.clip(np.exp(-cents / 350.0), 0.0, 1.0))  # ~350 cents half-life
-
-    std_sim = _sim_from_rel_diff(
-        _safe(a.get("pitch_std")), _safe(b.get("pitch_std")), scale=40.0
-    )
+    mean_sim = float(np.clip(np.exp(-cents / 350.0), 0.0, 1.0))
+    std_sim = _sim_from_rel_diff(_safe(a.get("pitch_std")), _safe(b.get("pitch_std")), 40.0)
     range_sim = _sim_from_rel_diff(
-        _safe(a.get("pitch_range")), _safe(b.get("pitch_range")), scale=80.0
+        _safe(a.get("pitch_range")), _safe(b.get("pitch_range")), 80.0
     )
-    return float(0.55 * mean_sim + 0.25 * std_sim + 0.20 * range_sim)
+
+    # Contour shape: compare normalized valid pitch sequences (speech intonation)
+    ca = [p for p in (a.get("pitch_contour_plot") or []) if p]
+    cb = [p for p in (b.get("pitch_contour_plot") or []) if p]
+    contour_sim = 0.5
+    if len(ca) >= 4 and len(cb) >= 4:
+        # resample to 32 points, convert to cents relative to median
+        def norm_c(seq):
+            arr = np.asarray(seq, dtype=float)
+            idx = np.linspace(0, len(arr) - 1, 32).astype(int)
+            arr = arr[idx]
+            med = np.median(arr)
+            return 1200.0 * np.log2(arr / (med + 1e-9))
+
+        try:
+            na, nb = norm_c(ca), norm_c(cb)
+            dist = float(np.mean(np.abs(na - nb)))
+            contour_sim = float(np.clip(np.exp(-dist / 200.0), 0.0, 1.0))
+        except Exception:
+            contour_sim = 0.5
+
+    return float(0.40 * mean_sim + 0.20 * std_sim + 0.15 * range_sim + 0.25 * contour_sim)
 
 
 def _spectral_score(a: dict, b: dict) -> float:
@@ -279,9 +488,7 @@ def _envelope_score(a: dict, b: dict) -> float:
                     _safe(a.get("decay_time")), _safe(b.get("decay_time")), 0.25
                 ),
                 _sim_from_rel_diff(
-                    _safe(a.get("duration"), 1.0),
-                    _safe(b.get("duration"), 1.0),
-                    2.0,
+                    _safe(a.get("duration"), 1.0), _safe(b.get("duration"), 1.0), 2.0
                 ),
             ]
         )
@@ -305,8 +512,7 @@ def _energy_score(a: dict, b: dict) -> float:
 
 
 def _temporal_score(a: dict, b: dict) -> float:
-    ma = a.get("mfcc_matrix")
-    mb = b.get("mfcc_matrix")
+    ma, mb = a.get("mfcc_matrix"), b.get("mfcc_matrix")
     if ma is None or mb is None:
         return 0.5
     dist = dtw_mfcc_distance(np.asarray(ma), np.asarray(mb))
@@ -314,7 +520,6 @@ def _temporal_score(a: dict, b: dict) -> float:
 
 
 def _verdict(score_pct: float, mode: str) -> str:
-    """Human label — conservative language for voice mode."""
     if mode == "voice":
         if score_pct >= 85:
             return "Strong acoustic similarity (same source plausible — not proven)"
@@ -325,7 +530,6 @@ def _verdict(score_pct: float, mode: str) -> str:
         if score_pct >= 40:
             return "Weak similarity (notable differences)"
         return "Low similarity (likely different acoustic sources or conditions)"
-    # general sound
     if score_pct >= 85:
         return "Very high match — timbre/pitch/shape align closely"
     if score_pct >= 70:
@@ -349,9 +553,9 @@ def _dimension_comment(name: str, pct: float, a: dict, b: dict) -> str:
         if not pa or not pb:
             return "Pitch comparison limited (one or both clips lack stable pitch)."
         if pct >= 80:
-            return f"Pitch centres close ({pa:.0f} Hz vs {pb:.0f} Hz) with similar variation."
+            return f"Pitch centres close ({pa:.0f} Hz vs {pb:.0f} Hz); intonation shape related."
         if pct >= 55:
-            return f"Pitch related but shifted ({pa:.0f} Hz vs {pb:.0f} Hz) or different intonation."
+            return f"Pitch related but shifted ({pa:.0f} Hz vs {pb:.0f} Hz) or different melody."
         return f"Pitch centres differ substantially ({pa:.0f} Hz vs {pb:.0f} Hz)."
     if name == "spectral":
         if pct >= 80:
@@ -373,52 +577,63 @@ def _dimension_comment(name: str, pct: float, a: dict, b: dict) -> str:
         if pct >= 80:
             return "MFCC sequence alignment (DTW) is strong — evolution over time matches."
         if pct >= 55:
-            return "Moderate temporal alignment; similar material, different pacing."
-        return "Time evolution of timbre does not align well under DTW."
+            return (
+                "Moderate temporal alignment. For speech: different words lower this "
+                "even if the same person — timbre/pitch matter more."
+            )
+        return (
+            "Time evolution does not align (different words, timing, or material). "
+            "Normal for speech with different text."
+        )
     return ""
 
 
-def write_analysis_report(
-    result: dict[str, Any],
-    language: str = "en",
-) -> str:
-    """
-    Rule-based written forensic report (English or Danish).
-    No generative AI — pure templates + measured numbers.
-    """
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+def write_analysis_report(result: dict[str, Any], language: str = "en") -> str:
     a = result["profile_a"]
     b = result["profile_b"]
     score = result["score_pct"]
     dims = result["dimensions"]
     mode = result.get("mode", "sound")
     verdict = result["verdict"]
+    rel = result.get("reliability") or {}
 
     if language == "da":
-        return _report_da(a, b, score, dims, mode, verdict, result)
-    return _report_en(a, b, score, dims, mode, verdict, result)
+        return _report_da(a, b, score, dims, mode, verdict, result, rel)
+    return _report_en(a, b, score, dims, mode, verdict, result, rel)
 
 
-def _report_en(a, b, score, dims, mode, verdict, result) -> str:
-    lines = []
-    lines.append("AETHER FORENSICS REPORT")
-    lines.append("=" * 48)
-    lines.append(f"Mode: {mode.upper()}")
-    lines.append(f"Sample A: {a.get('label', 'A')}  ({a.get('duration', 0):.2f}s)")
-    lines.append(f"Sample B: {b.get('label', 'B')}  ({b.get('duration', 0):.2f}s)")
-    lines.append(f"Overall match score: {score:.1f}%")
-    lines.append(f"Verdict: {verdict}")
-    lines.append("")
-    lines.append("DISCLAIMER")
-    lines.append("-" * 48)
-    lines.append(
-        "Classical DSP comparison only (MFCC, pitch, spectral shape, envelope, DTW). "
-        "NOT a court-grade biometric speaker ID system. "
-        "Same room/mic/codec can raise scores; different phones/rooms can lower them. "
-        "Use as investigative / creative guidance, not legal proof."
-    )
-    lines.append("")
-    lines.append("DIMENSION BREAKDOWN")
-    lines.append("-" * 48)
+def _report_en(a, b, score, dims, mode, verdict, result, rel) -> str:
+    lines = [
+        "AETHER FORENSICS REPORT",
+        "=" * 48,
+        f"Mode: {mode.upper()}",
+        f"Sample A: {a.get('label', 'A')}  ({a.get('duration', 0):.2f}s)",
+        f"Sample B: {b.get('label', 'B')}  ({b.get('duration', 0):.2f}s)",
+        f"Overall match score: {score:.1f}%",
+        f"Reliability: {rel.get('reliability_pct', '—')}% — {rel.get('label', '')}",
+        f"Verdict: {verdict}",
+        "",
+        "SPEECH / TALE NOTE",
+        "-" * 48,
+        "Ordinary speech works in VOICE mode. You do NOT need the same words.",
+        "Different sentences still compare vocal colour (timbre, pitch range).",
+        "DTW/temporal score often drops when text differs — that is expected.",
+        "Best: ≥3s dry speech per clip, similar phone/mic, little background music.",
+        "",
+        "DISCLAIMER",
+        "-" * 48,
+        "Classical DSP only. NOT court-grade speaker ID. Guidance only, not legal proof.",
+        "",
+        "RELIABILITY REASONS",
+        "-" * 48,
+    ]
+    for r in rel.get("reasons") or []:
+        lines.append(f"  • {r}")
+    lines += ["", "DIMENSION BREAKDOWN", "-" * 48]
     for key, label in [
         ("timbre_mfcc", "Timbre (MFCC / mel)"),
         ("pitch", "Pitch / intonation"),
@@ -428,126 +643,76 @@ def _report_en(a, b, score, dims, mode, verdict, result) -> str:
         ("temporal_align", "Temporal alignment (DTW)"),
     ]:
         d = dims.get(key) or {}
-        pct = d.get("pct", 0)
-        lines.append(f"  {label:28s}  {pct:5.1f}%")
-        comment = d.get("comment") or ""
-        if comment:
-            lines.append(f"      → {comment}")
-    lines.append("")
-    lines.append("KEY MEASUREMENTS")
-    lines.append("-" * 48)
-    lines.append(
-        f"  Pitch mean     A: {a.get('pitch_hz') or '—'} Hz    B: {b.get('pitch_hz') or '—'} Hz"
-    )
-    lines.append(
-        f"  Centroid       A: {a.get('spectral_centroid', 0):.0f} Hz   "
-        f"B: {b.get('spectral_centroid', 0):.0f} Hz"
-    )
-    lines.append(
-        f"  Flatness       A: {a.get('spectral_flatness', 0):.4f}    "
-        f"B: {b.get('spectral_flatness', 0):.4f}"
-    )
-    lines.append(
-        f"  Attack         A: {a.get('attack_time', 0):.3f}s     "
-        f"B: {b.get('attack_time', 0):.3f}s"
-    )
-    lines.append(
-        f"  Voicing proxy  A: {100 * _safe(a.get('voiced_ratio')):.0f}%      "
-        f"B: {100 * _safe(b.get('voiced_ratio')):.0f}%"
-    )
-    lines.append("")
-    lines.append("INTERPRETATION")
-    lines.append("-" * 48)
-    # Top strengths / weaknesses
-    ranked = sorted(
-        ((k, dims[k]["pct"]) for k in dims),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    strong = [k for k, p in ranked if p >= 70][:3]
-    weak = [k for k, p in ranked if p < 55][:3]
-    name_map = {
-        "timbre_mfcc": "timbre",
-        "pitch": "pitch",
-        "spectral": "spectral shape",
-        "envelope": "envelope",
-        "energy_dynamics": "energy dynamics",
-        "temporal_align": "temporal alignment",
-    }
-    if strong:
-        lines.append(
-            "Strongest agreement: " + ", ".join(name_map.get(k, k) for k in strong) + "."
-        )
-    if weak:
-        lines.append(
-            "Largest disagreements: " + ", ".join(name_map.get(k, k) for k in weak) + "."
-        )
-    if mode == "voice":
-        lines.append(
-            "Voice mode emphasises pitch centre/variation and MFCC timbre. "
-            "For better results use dry speech (little music), similar loudness, "
-            "and clips longer than ~2–3 seconds."
-        )
-    else:
-        lines.append(
-            "Sound mode balances timbre and spectral shape for drums, synths, FX, etc."
-        )
-    lines.append("")
-    lines.append(f"Weights used: {result.get('weights', {})}")
-    lines.append("Generated by AETHER Forensics (classical DSP, zero ML).")
+        lines.append(f"  {label:28s}  {d.get('pct', 0):5.1f}%")
+        if d.get("comment"):
+            lines.append(f"      → {d['comment']}")
+    lines += [
+        "",
+        "KEY MEASUREMENTS",
+        "-" * 48,
+        f"  Pitch mean     A: {a.get('pitch_hz') or '—'} Hz    B: {b.get('pitch_hz') or '—'} Hz",
+        f"  Centroid       A: {a.get('spectral_centroid', 0):.0f} Hz   B: {b.get('spectral_centroid', 0):.0f} Hz",
+        f"  Flatness       A: {a.get('spectral_flatness', 0):.4f}    B: {b.get('spectral_flatness', 0):.4f}",
+        f"  Voicing proxy  A: {100 * _safe(a.get('voiced_ratio')):.0f}%      B: {100 * _safe(b.get('voiced_ratio')):.0f}%",
+        "",
+        "Generated by AETHER Forensics v2 (classical DSP, zero ML).",
+    ]
     return "\n".join(lines)
 
 
-def _report_da(a, b, score, dims, mode, verdict, result) -> str:
-    # Map verdict stay in English structure but Danish body
-    lines = []
-    lines.append("AETHER FORENSICS-RAPPORT")
-    lines.append("=" * 48)
-    lines.append(f"Tilstand: {mode.upper()}")
-    lines.append(f"Sample A: {a.get('label', 'A')}  ({a.get('duration', 0):.2f}s)")
-    lines.append(f"Sample B: {b.get('label', 'B')}  ({b.get('duration', 0):.2f}s)")
-    lines.append(f"Samlet match-score: {score:.1f}%")
-    lines.append(f"Konklusion: {verdict}")
-    lines.append("")
-    lines.append("ANSVARSFRASKRIVELSE")
-    lines.append("-" * 48)
-    lines.append(
-        "Kun klassisk DSP-sammenligning (MFCC, pitch, spektrum, envelope, DTW). "
-        "IKKE retsmedicinsk biometrisk stemme-ID. "
-        "Samme rum/mikrofon kan hæve scoren; forskellige telefoner/rum kan sænke den. "
-        "Brug som vejledning — ikke som juridisk bevis."
-    )
-    lines.append("")
-    lines.append("DIMENSIONER")
-    lines.append("-" * 48)
+def _report_da(a, b, score, dims, mode, verdict, result, rel) -> str:
+    lines = [
+        "AETHER FORENSICS-RAPPORT",
+        "=" * 48,
+        f"Tilstand: {mode.upper()}",
+        f"Sample A: {a.get('label', 'A')}  ({a.get('duration', 0):.2f}s)",
+        f"Sample B: {b.get('label', 'B')}  ({b.get('duration', 0):.2f}s)",
+        f"Samlet match-score: {score:.1f}%",
+        f"Pålidelighed: {rel.get('reliability_pct', '—')}% — {rel.get('label', '')}",
+        f"Konklusion: {verdict}",
+        "",
+        "OM ALMINDELIG TALE",
+        "-" * 48,
+        "VOICE-mode virker på almindelig tale. I behøver IKKE sige de samme ord.",
+        "Forskellige sætninger sammenligner stadig stemmeklang (timbre, pitch-område).",
+        "DTW/tids-score falder ofte når teksten er forskellig — det er forventeligt.",
+        "Bedst: ≥3 sek tør tale pr. klip, lignende telefon/mic, lidt baggrundsstøj.",
+        "",
+        "ANSVARSFRASKRIVELSE",
+        "-" * 48,
+        "Kun klassisk DSP. IKKE retsmedicinsk stemme-ID. Vejledning — ikke bevis.",
+        "",
+        "PÅLIDELIGHED",
+        "-" * 48,
+    ]
+    for r in rel.get("reasons") or []:
+        lines.append(f"  • {r}")
+    lines += ["", "DIMENSIONER", "-" * 48]
     labels_da = {
         "timbre_mfcc": "Klang (MFCC / mel)",
         "pitch": "Pitch / intonation",
         "spectral": "Spektral form",
-        "envelope": "Envelope / artikulation",
+        "envelope": "Envelope",
         "energy_dynamics": "Energi-dynamik",
         "temporal_align": "Tids-alignment (DTW)",
     }
     for key, label in labels_da.items():
         d = dims.get(key) or {}
-        pct = d.get("pct", 0)
-        lines.append(f"  {label:28s}  {pct:5.1f}%")
+        lines.append(f"  {label:28s}  {d.get('pct', 0):5.1f}%")
         if d.get("comment"):
             lines.append(f"      → {d['comment']}")
     lines.append("")
-    lines.append("NØGLETAL")
-    lines.append("-" * 48)
-    lines.append(
-        f"  Pitch mean     A: {a.get('pitch_hz') or '—'} Hz    B: {b.get('pitch_hz') or '—'} Hz"
-    )
-    lines.append(
-        f"  Centroid       A: {a.get('spectral_centroid', 0):.0f} Hz   "
-        f"B: {b.get('spectral_centroid', 0):.0f} Hz"
-    )
-    lines.append("")
-    lines.append("Fortolkning følger de målte dimensioner ovenfor. "
-                 "Genereret af AETHER Forensics (klassisk DSP, ingen ML).")
+    lines.append("Genereret af AETHER Forensics v2 (klassisk DSP, ingen ML).")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Compare
+# ---------------------------------------------------------------------------
+
+def _light_profile(p: dict) -> dict:
+    skip = {"mfcc_matrix"}
+    return {k: v for k, v in p.items() if k not in skip}
 
 
 def compare_profiles(
@@ -558,28 +723,10 @@ def compare_profiles(
     weights: Optional[dict[str, float]] = None,
     language: str = "en",
 ) -> dict[str, Any]:
-    """
-    Compare two forensic profiles.
-
-    mode:
-      - "sound"  — balanced for general audio / samples
-      - "voice"  — emphasise pitch + MFCC timbre (speech/vox)
-    """
     mode = mode if mode in ("sound", "voice") else "sound"
-    w = dict(DEFAULT_WEIGHTS)
-    if mode == "voice":
-        w = {
-            "timbre_mfcc": 0.36,
-            "pitch": 0.28,
-            "spectral": 0.14,
-            "envelope": 0.08,
-            "energy_dynamics": 0.06,
-            "temporal_align": 0.08,
-        }
+    w = dict(VOICE_WEIGHTS if mode == "voice" else DEFAULT_WEIGHTS)
     if weights:
         w.update(weights)
-
-    # Normalize weights
     s = sum(w.values()) or 1.0
     w = {k: v / s for k, v in w.items()}
 
@@ -605,21 +752,18 @@ def compare_profiles(
         overall += w.get(k, 0) * sim
 
     score_pct = round(100.0 * float(np.clip(overall, 0.0, 1.0)), 1)
-    verdict = _verdict(score_pct, mode)
-
-    # Strip heavy matrices from returned profiles for JSON/UI
-    def light(p: dict) -> dict:
-        return {k: v for k, v in p.items() if k != "mfcc_matrix"}
+    reliability = estimate_reliability(profile_a, profile_b)
 
     result = {
         "score_pct": score_pct,
         "score_01": round(float(overall), 4),
-        "verdict": verdict,
+        "verdict": _verdict(score_pct, mode),
         "mode": mode,
         "weights": w,
         "dimensions": dims,
-        "profile_a": light(profile_a),
-        "profile_b": light(profile_b),
+        "reliability": reliability,
+        "profile_a": _light_profile(profile_a),
+        "profile_b": _light_profile(profile_b),
     }
     result["report"] = write_analysis_report(result, language=language)
     return result
@@ -635,10 +779,32 @@ def compare_audio_arrays(
     mode: str = "sound",
     settings: Optional[AnalysisSettings] = None,
     language: str = "en",
+    start_a: float = 0.0,
+    end_a: Optional[float] = None,
+    start_b: float = 0.0,
+    end_b: Optional[float] = None,
+    rms_normalize: bool = True,
+    highpass_speech: bool = True,
 ) -> dict[str, Any]:
     settings = settings or AnalysisSettings()
-    pa = extract_forensic_profile(y_a, sr, settings=settings, label=label_a)
-    pb = extract_forensic_profile(y_b, sr, settings=settings, label=label_b)
+    hp = 80.0 if (mode == "voice" and highpass_speech) else 0.0
+
+    ya, meta_a = preprocess_audio(
+        y_a, sr, start_sec=start_a, end_sec=end_a,
+        rms_normalize=rms_normalize, highpass_hz=hp,
+    )
+    yb, meta_b = preprocess_audio(
+        y_b, sr, start_sec=start_b, end_sec=end_b,
+        rms_normalize=rms_normalize, highpass_hz=hp,
+    )
+    pa = extract_forensic_profile(
+        ya, sr, settings=settings, label=label_a, mode=mode,
+        already_preprocessed=True, preprocess_meta=meta_a,
+    )
+    pb = extract_forensic_profile(
+        yb, sr, settings=settings, label=label_b, mode=mode,
+        already_preprocessed=True, preprocess_meta=meta_b,
+    )
     return compare_profiles(pa, pb, mode=mode, language=language)
 
 
@@ -649,8 +815,79 @@ def compare_files(
     mode: str = "sound",
     settings: Optional[AnalysisSettings] = None,
     language: str = "en",
+    start_a: float = 0.0,
+    end_a: Optional[float] = None,
+    start_b: float = 0.0,
+    end_b: Optional[float] = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     settings = settings or AnalysisSettings()
-    pa = extract_forensic_profile_from_path(path_a, settings=settings)
-    pb = extract_forensic_profile_from_path(path_b, settings=settings)
-    return compare_profiles(pa, pb, mode=mode, language=language)
+    ya, sr_a, meta_a = load_audio(path_a, settings=settings)
+    yb, sr_b, meta_b = load_audio(path_b, settings=settings)
+    # Resample B to A's rate if needed
+    if sr_a != sr_b:
+        yb = librosa.resample(yb, orig_sr=sr_b, target_sr=sr_a)
+    return compare_audio_arrays(
+        ya, yb, sr_a,
+        label_a=meta_a.get("filename") or path_a,
+        label_b=meta_b.get("filename") or path_b,
+        mode=mode, settings=settings, language=language,
+        start_a=start_a, end_a=end_a, start_b=start_b, end_b=end_b,
+        **kwargs,
+    )
+
+
+def compare_reference_vs_many(
+    y_ref: np.ndarray,
+    candidates: list[tuple[str, np.ndarray]],
+    sr: int = 44100,
+    *,
+    mode: str = "voice",
+    settings: Optional[AnalysisSettings] = None,
+    language: str = "en",
+    label_ref: str = "Reference",
+    start_ref: float = 0.0,
+    end_ref: Optional[float] = None,
+) -> dict[str, Any]:
+    """
+    Rank many candidates against one reference.
+    candidates: list of (label, waveform)
+    """
+    settings = settings or AnalysisSettings()
+    rankings = []
+    for label, y_c in candidates:
+        try:
+            r = compare_audio_arrays(
+                y_ref, y_c, sr,
+                label_a=label_ref, label_b=label,
+                mode=mode, settings=settings, language=language,
+                start_a=start_ref, end_a=end_ref,
+            )
+            rankings.append(
+                {
+                    "label": label,
+                    "score_pct": r["score_pct"],
+                    "reliability_pct": r["reliability"]["reliability_pct"],
+                    "verdict": r["verdict"],
+                    "dimensions": {k: v["pct"] for k, v in r["dimensions"].items()},
+                    "result": r,
+                }
+            )
+        except Exception as exc:
+            rankings.append(
+                {
+                    "label": label,
+                    "score_pct": 0.0,
+                    "reliability_pct": 0.0,
+                    "verdict": f"Error: {exc}",
+                    "dimensions": {},
+                    "result": None,
+                }
+            )
+    rankings.sort(key=lambda x: x["score_pct"], reverse=True)
+    return {
+        "reference": label_ref,
+        "mode": mode,
+        "rankings": rankings,
+        "best": rankings[0] if rankings else None,
+    }

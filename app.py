@@ -39,8 +39,13 @@ from aether.export_utils import (
     export_midi_bytes,
     extract_event_audio,
 )
-from aether.forensics import compare_audio_arrays, compare_files
-from aether.loader import is_url, save_temp_upload
+from aether.forensics import (
+    compare_audio_arrays,
+    compare_files,
+    compare_reference_vs_many,
+    write_analysis_report,
+)
+from aether.loader import is_url, load_audio, save_temp_upload
 from aether.pipeline import run_analysis
 from aether.resonance import resonance_for_event
 from aether.session_io import load_session_zip, save_session_zip
@@ -53,7 +58,14 @@ from aether.viz import (
     spectrogram_figure,
     timeline_figure,
 )
-from aether.viz_forensics import forensics_dimension_bars, forensics_score_gauge
+from aether.viz_forensics import (
+    forensics_dimension_bars,
+    forensics_pitch_overlay,
+    forensics_ranking_bars,
+    forensics_reliability_bar,
+    forensics_score_gauge,
+    forensics_spectrogram_pair,
+)
 
 # ---------------------------------------------------------------------------
 # Page config & dark theme
@@ -291,6 +303,7 @@ def _init_state() -> None:
         "session_zip_stem": None,
         "app_mode": "track",
         "forensics_result": None,
+        "forensics_ranking": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -722,66 +735,217 @@ def render_event_detail(event: dict, analysis: dict) -> None:
     render_preset_section(event)
 
 
+def _forensics_light_json(result: dict) -> dict:
+    skip = {"mel_mean", "mfcc_matrix", "y_plot", "pitch_contour_plot", "pitch_times"}
+    return {
+        "score_pct": result.get("score_pct"),
+        "verdict": result.get("verdict"),
+        "mode": result.get("mode"),
+        "reliability": result.get("reliability"),
+        "dimensions": result.get("dimensions"),
+        "profile_a": {
+            k: v for k, v in (result.get("profile_a") or {}).items() if k not in skip
+        },
+        "profile_b": {
+            k: v for k, v in (result.get("profile_b") or {}).items() if k not in skip
+        },
+        "report": result.get("report"),
+    }
+
+
 def render_forensics_page(settings: AnalysisSettings) -> None:
     """
-    Side-by-side sound / voice comparison:
-    % match + dimension bars + written classical-DSP report.
+    Forensics v2: A/B or 1-vs-N, speech-ready, trim/normalize/reliability,
+    spectrogram + pitch, written report.
     """
-    st.markdown("## ◈ Forensics — compare two sounds or voices")
+    st.markdown("## ◈ Forensics — sounds, voices & ordinary speech")
     st.caption(
-        "Classical DSP only (MFCC, pitch, spectral shape, envelope, DTW). "
-        "**Not** court-grade speaker ID · not biometric proof."
+        "Classical DSP (MFCC, pitch, spectral, envelope, DTW). "
+        "**Voice mode works on normal speech (tale)** — same words not required. "
+        "Not court-grade speaker ID."
     )
 
-    c1, c2, c3 = st.columns([1, 1, 1])
+    c1, c2, c3 = st.columns(3)
     with c1:
         mode = st.radio(
             "Compare mode",
-            options=["sound", "voice"],
-            format_func=lambda x: "General sound / sample" if x == "sound" else "Voice / speech (vox)",
+            options=["voice", "sound"],
+            format_func=lambda x: (
+                "Voice / speech (tale)" if x == "voice" else "General sound / sample"
+            ),
             horizontal=True,
             key="forensics_mode",
         )
     with c2:
         language = st.radio(
             "Report language",
-            options=["en", "da"],
-            format_func=lambda x: "English" if x == "en" else "Dansk",
+            options=["da", "en"],
+            format_func=lambda x: "Dansk" if x == "da" else "English",
             horizontal=True,
             key="forensics_lang",
         )
     with c3:
-        source_mode = st.radio(
-            "Sources",
-            options=["upload", "events"],
-            format_func=lambda x: "Upload two files" if x == "upload" else "Two events from track",
+        workflow = st.radio(
+            "Workflow",
+            options=["pair", "lineup"],
+            format_func=lambda x: (
+                "A vs B" if x == "pair" else "1 reference vs many"
+            ),
             horizontal=True,
-            key="forensics_source",
+            key="forensics_workflow",
         )
+
+    with st.expander("Tips for ordinary speech (tale)", expanded=False):
+        st.markdown(
+            """
+- Brug **Voice / speech** mode  
+- **≥ 3 sekunder** tør tale pr. klip (5–10 sek er bedre)  
+- I behøver **ikke** sige de samme ord — vi måler klang/pitch, ikke indhold  
+- Samme telefon/rum giver renere scores; forskellig mic sænker ofte scoren  
+- Baggrundsmusik og støj sænker **reliability**  
+- Lav **DTW/temporal** er normalt når teksten er forskellig — kig på **timbre + pitch**
+            """
+        )
+
+    # ----- 1-vs-N lineup -----
+    if workflow == "lineup":
+        st.markdown("#### Reference vs candidates")
+        ref_file = st.file_uploader(
+            "Reference (known voice / sound)",
+            type=["mp3", "wav", "flac", "ogg", "m4a"],
+            key="for_ref",
+        )
+        cand_files = st.file_uploader(
+            "Candidates (multiple)",
+            type=["mp3", "wav", "flac", "ogg", "m4a"],
+            accept_multiple_files=True,
+            key="for_cands",
+        )
+        col_r1, col_r2 = st.columns(2)
+        with col_r1:
+            start_ref = st.number_input("Ref start (s)", 0.0, 600.0, 0.0, 0.1, key="ref_start")
+        with col_r2:
+            end_ref = st.number_input(
+                "Ref end (s, 0 = full)", 0.0, 600.0, 0.0, 0.1, key="ref_end"
+            )
+        end_ref_v = None if end_ref <= 0 else float(end_ref)
+
+        if st.button("▶ Rank candidates", type="primary", use_container_width=True):
+            if ref_file is None or not cand_files:
+                st.error("Upload a reference and at least one candidate.")
+            else:
+                paths = []
+                try:
+                    with st.spinner("Comparing reference to all candidates…"):
+                        p_ref = save_temp_upload(ref_file.getvalue(), ref_file.name)
+                        paths.append(p_ref)
+                        y_ref, sr, _ = load_audio(p_ref, settings=settings)
+                        cands = []
+                        for cf in cand_files:
+                            p = save_temp_upload(cf.getvalue(), cf.name)
+                            paths.append(p)
+                            y_c, sr_c, _ = load_audio(p, settings=settings)
+                            if sr_c != sr:
+                                import librosa as _lr
+
+                                y_c = _lr.resample(y_c, orig_sr=sr_c, target_sr=sr)
+                            cands.append((cf.name, y_c))
+                        ranking = compare_reference_vs_many(
+                            y_ref,
+                            cands,
+                            sr,
+                            mode=mode,
+                            settings=settings,
+                            language=language,
+                            label_ref=ref_file.name,
+                            start_ref=float(start_ref),
+                            end_ref=end_ref_v,
+                        )
+                        st.session_state.forensics_ranking = ranking
+                        if ranking.get("best") and ranking["best"].get("result"):
+                            st.session_state.forensics_result = ranking["best"]["result"]
+                except Exception as exc:
+                    st.error(f"Line-up failed: {exc}")
+                finally:
+                    for p in paths:
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+        ranking = st.session_state.get("forensics_ranking")
+        if ranking and ranking.get("rankings"):
+            st.success(
+                f"Best match: **{ranking['best']['label']}** "
+                f"at **{ranking['best']['score_pct']}%**"
+                if ranking.get("best")
+                else "Done"
+            )
+            st.plotly_chart(
+                forensics_ranking_bars(ranking["rankings"]),
+                use_container_width=True,
+            )
+            for i, r in enumerate(ranking["rankings"], 1):
+                st.markdown(
+                    f"**#{i} {r['label']}** — `{r['score_pct']}%` match · "
+                    f"reliability `{r['reliability_pct']}%`  \n"
+                    f"{r['verdict']}"
+                )
+        return
+
+    # ----- A vs B -----
+    source_mode = st.radio(
+        "Sources",
+        options=["upload", "events"],
+        format_func=lambda x: "Upload two files" if x == "upload" else "Two events from track",
+        horizontal=True,
+        key="forensics_source",
+    )
 
     y_a = y_b = None
     sr = 44100
     label_a, label_b = "A", "B"
     path_a = path_b = None
+    dur_a = dur_b = 30.0
 
     if source_mode == "upload":
         u1, u2 = st.columns(2)
         with u1:
-            f_a = st.file_uploader("Sample A", type=["mp3", "wav", "flac", "ogg", "m4a"], key="for_a")
+            f_a = st.file_uploader(
+                "Sample A (e.g. speech clip)",
+                type=["mp3", "wav", "flac", "ogg", "m4a"],
+                key="for_a",
+            )
         with u2:
-            f_b = st.file_uploader("Sample B", type=["mp3", "wav", "flac", "ogg", "m4a"], key="for_b")
+            f_b = st.file_uploader(
+                "Sample B",
+                type=["mp3", "wav", "flac", "ogg", "m4a"],
+                key="for_b",
+            )
         if f_a is not None:
             path_a = save_temp_upload(f_a.getvalue(), f_a.name)
             label_a = f_a.name
             st.audio(f_a.getvalue())
+            try:
+                ya_tmp, sr_tmp, _ = load_audio(path_a, settings=settings)
+                dur_a = len(ya_tmp) / sr_tmp
+            except Exception:
+                pass
         if f_b is not None:
             path_b = save_temp_upload(f_b.getvalue(), f_b.name)
             label_b = f_b.name
             st.audio(f_b.getvalue())
+            try:
+                yb_tmp, sr_tmp, _ = load_audio(path_b, settings=settings)
+                dur_b = len(yb_tmp) / sr_tmp
+            except Exception:
+                pass
     else:
         analysis = st.session_state.get("analysis")
         if analysis is None or not analysis.get("events") or analysis.get("y") is None:
-            st.warning("Run a **track analysis** first (or load a session with audio), then pick two events.")
+            st.warning(
+                "Run a **track analysis** first (or load a session with audio), then pick two events."
+            )
             return
         events = analysis["events"]
         labels = [
@@ -793,7 +957,9 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
         with e1:
             pick_a = st.selectbox("Event A", options=labels, key="for_ev_a")
         with e2:
-            pick_b = st.selectbox("Event B", options=labels, index=min(1, len(labels) - 1), key="for_ev_b")
+            pick_b = st.selectbox(
+                "Event B", options=labels, index=min(1, len(labels) - 1), key="for_ev_b"
+            )
         sr = int(analysis.get("sr") or 44100)
         y = analysis["y"]
         ev_a = next(e for e in events if e["id"] == id_by_label[pick_a])
@@ -801,27 +967,57 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
         y_a = extract_event_audio(y, sr, ev_a)
         y_b = extract_event_audio(y, sr, ev_b)
         label_a, label_b = ev_a["id"], ev_b["id"]
+        dur_a = float(ev_a.get("duration") or len(y_a) / sr)
+        dur_b = float(ev_b.get("duration") or len(y_b) / sr)
         st.audio(y_a, sample_rate=sr)
         st.audio(y_b, sample_rate=sr)
+
+    st.markdown("#### Region + normalize")
+    r1, r2, r3, r4 = st.columns(4)
+    with r1:
+        start_a = st.number_input("A start (s)", 0.0, float(max(dur_a, 0.1)), 0.0, 0.1, key="sa")
+    with r2:
+        end_a_in = st.number_input(
+            "A end (s, 0=full)", 0.0, 600.0, 0.0, 0.1, key="ea"
+        )
+    with r3:
+        start_b = st.number_input("B start (s)", 0.0, float(max(dur_b, 0.1)), 0.0, 0.1, key="sb")
+    with r4:
+        end_b_in = st.number_input(
+            "B end (s, 0=full)", 0.0, 600.0, 0.0, 0.1, key="eb"
+        )
+    rms_norm = st.checkbox("RMS loudness normalize (recommended)", value=True, key="rms_n")
+    hp_speech = st.checkbox(
+        "Speech high-pass (~80 Hz) in voice mode", value=True, key="hp_sp"
+    )
+
+    end_a = None if end_a_in <= 0 else float(end_a_in)
+    end_b = None if end_b_in <= 0 else float(end_b_in)
 
     run = st.button("▶ Run forensics comparison", type="primary", use_container_width=True)
 
     if run:
         try:
-            with st.spinner("Extracting forensic profiles + scoring…"):
+            with st.spinner("Preprocess + forensic profiles + scoring…"):
                 if source_mode == "upload":
                     if not path_a or not path_b:
                         st.error("Upload **both** Sample A and Sample B.")
                         return
                     result = compare_files(
-                        path_a, path_b, mode=mode, settings=settings, language=language
+                        path_a,
+                        path_b,
+                        mode=mode,
+                        settings=settings,
+                        language=language,
+                        start_a=float(start_a),
+                        end_a=end_a,
+                        start_b=float(start_b),
+                        end_b=end_b,
+                        rms_normalize=rms_norm,
+                        highpass_speech=hp_speech,
                     )
-                    # Fix labels from filenames
                     result["profile_a"]["label"] = label_a
                     result["profile_b"]["label"] = label_b
-                    result["report"] = result["report"]  # already generated; regenerate with labels
-                    from aether.forensics import write_analysis_report
-
                     result["report"] = write_analysis_report(result, language=language)
                 else:
                     result = compare_audio_arrays(
@@ -833,13 +1029,18 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
                         mode=mode,
                         settings=settings,
                         language=language,
+                        start_a=float(start_a),
+                        end_a=end_a,
+                        start_b=float(start_b),
+                        end_b=end_b,
+                        rms_normalize=rms_norm,
+                        highpass_speech=hp_speech,
                     )
             st.session_state.forensics_result = result
         except Exception as exc:
             st.error(f"Forensics failed: {exc}")
             return
         finally:
-            # Cleanup temp uploads
             for p in (path_a, path_b):
                 if p:
                     try:
@@ -850,19 +1051,29 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
     result = st.session_state.get("forensics_result")
     if not result:
         st.info(
-            "Upload two clips (or pick two events) and run comparison. "
-            "You’ll get a **0–100%** score, dimension breakdown, and a written report."
+            "Upload two speech/sound clips (or pick two events). "
+            "You get **match %**, **reliability %**, spectrograms, pitch curves, and a written report."
         )
         return
 
     score = result["score_pct"]
-    st.markdown(f"### Score: `{score:.1f}%`")
+    rel = result.get("reliability") or {}
+    st.markdown(f"### Match: `{score:.1f}%`  ·  Reliability: `{rel.get('reliability_pct', '—')}%`")
     st.markdown(f"**{result['verdict']}**")
+    st.caption(rel.get("label") or "")
 
-    g1, g2 = st.columns([1, 1.2])
+    g1, g2 = st.columns(2)
     with g1:
         st.plotly_chart(
             forensics_score_gauge(score, title=f"{result.get('mode', 'sound').title()} match"),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+        st.plotly_chart(
+            forensics_reliability_bar(
+                float(rel.get("reliability_pct") or 0),
+                label="Reliability (clip length / quality)",
+            ),
             use_container_width=True,
             config={"displayModeBar": False},
         )
@@ -873,44 +1084,57 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
             config={"displayModeBar": False},
         )
 
+    if rel.get("reasons"):
+        with st.expander("Reliability reasons", expanded=True):
+            for r in rel["reasons"]:
+                st.markdown(f"- {r}")
+
+    st.markdown("#### Visual evidence")
+    try:
+        st.plotly_chart(
+            forensics_spectrogram_pair(
+                result.get("profile_a") or {},
+                result.get("profile_b") or {},
+                sr=int((result.get("profile_a") or {}).get("sample_rate") or 44100),
+            ),
+            use_container_width=True,
+        )
+        st.plotly_chart(
+            forensics_pitch_overlay(
+                result.get("profile_a") or {}, result.get("profile_b") or {}
+            ),
+            use_container_width=True,
+        )
+    except Exception as exc:
+        st.caption(f"Plots unavailable: {exc}")
+
     st.markdown("#### Written analysis")
     st.code(result.get("report") or "", language="text")
-    st.download_button(
-        "Download report (.txt)",
-        data=(result.get("report") or "").encode("utf-8"),
-        file_name="aether_forensics_report.txt",
-        mime="text/plain",
-        key="dl_forensics_txt",
-    )
-    # JSON without huge mel arrays if needed — keep as is
-    light = {
-        "score_pct": result["score_pct"],
-        "verdict": result["verdict"],
-        "mode": result["mode"],
-        "dimensions": result["dimensions"],
-        "profile_a": {
-            k: v
-            for k, v in (result.get("profile_a") or {}).items()
-            if k not in ("mel_mean", "mfcc_matrix", "pitch_contour")
-        },
-        "profile_b": {
-            k: v
-            for k, v in (result.get("profile_b") or {}).items()
-            if k not in ("mel_mean", "mfcc_matrix", "pitch_contour")
-        },
-        "report": result.get("report"),
-    }
-    st.download_button(
-        "Download forensics JSON",
-        data=json.dumps(light, indent=2).encode("utf-8"),
-        file_name="aether_forensics.json",
-        mime="application/json",
-        key="dl_forensics_json",
-    )
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "Download report (.txt)",
+            data=(result.get("report") or "").encode("utf-8"),
+            file_name="aether_forensics_report.txt",
+            mime="text/plain",
+            key="dl_forensics_txt",
+            use_container_width=True,
+        )
+    with d2:
+        st.download_button(
+            "Download forensics JSON",
+            data=json.dumps(_forensics_light_json(result), indent=2).encode("utf-8"),
+            file_name="aether_forensics.json",
+            mime="application/json",
+            key="dl_forensics_json",
+            use_container_width=True,
+        )
 
     with st.expander("Dimension comments"):
         for key, dim in (result.get("dimensions") or {}).items():
-            st.markdown(f"**{key}** — `{dim.get('pct', 0):.1f}%`  \n{dim.get('comment', '')}")
+            st.markdown(
+                f"**{key}** — `{dim.get('pct', 0):.1f}%`  \n{dim.get('comment', '')}"
+            )
 
 
 def render_resonance_panel(analysis: dict, selected_id: Optional[str]) -> None:
