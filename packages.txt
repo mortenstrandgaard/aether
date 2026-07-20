@@ -1,0 +1,6 @@
+# System packages for Streamlit Community Cloud / Linux hosts
+# (apt packages — enables soundfile + optional URL downloads)
+
+ffmpeg
+libsndfile1
+libsox-dev
