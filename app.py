@@ -11,10 +11,12 @@ v1 features + extensions:
   - Cross-event Resonance Map
   - Environment status panel
   - Session save / load (.aether.zip)
+  - Forensics: compare two sounds/voices (% + written report)
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +39,7 @@ from aether.export_utils import (
     export_midi_bytes,
     extract_event_audio,
 )
+from aether.forensics import compare_audio_arrays, compare_files
 from aether.loader import is_url, save_temp_upload
 from aether.pipeline import run_analysis
 from aether.resonance import resonance_for_event
@@ -50,6 +53,7 @@ from aether.viz import (
     spectrogram_figure,
     timeline_figure,
 )
+from aether.viz_forensics import forensics_dimension_bars, forensics_score_gauge
 
 # ---------------------------------------------------------------------------
 # Page config & dark theme
@@ -285,6 +289,8 @@ def _init_state() -> None:
         "timeline_color_mode": "sound_class",
         "session_zip_bytes": None,
         "session_zip_stem": None,
+        "app_mode": "track",
+        "forensics_result": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -716,6 +722,197 @@ def render_event_detail(event: dict, analysis: dict) -> None:
     render_preset_section(event)
 
 
+def render_forensics_page(settings: AnalysisSettings) -> None:
+    """
+    Side-by-side sound / voice comparison:
+    % match + dimension bars + written classical-DSP report.
+    """
+    st.markdown("## ◈ Forensics — compare two sounds or voices")
+    st.caption(
+        "Classical DSP only (MFCC, pitch, spectral shape, envelope, DTW). "
+        "**Not** court-grade speaker ID · not biometric proof."
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        mode = st.radio(
+            "Compare mode",
+            options=["sound", "voice"],
+            format_func=lambda x: "General sound / sample" if x == "sound" else "Voice / speech (vox)",
+            horizontal=True,
+            key="forensics_mode",
+        )
+    with c2:
+        language = st.radio(
+            "Report language",
+            options=["en", "da"],
+            format_func=lambda x: "English" if x == "en" else "Dansk",
+            horizontal=True,
+            key="forensics_lang",
+        )
+    with c3:
+        source_mode = st.radio(
+            "Sources",
+            options=["upload", "events"],
+            format_func=lambda x: "Upload two files" if x == "upload" else "Two events from track",
+            horizontal=True,
+            key="forensics_source",
+        )
+
+    y_a = y_b = None
+    sr = 44100
+    label_a, label_b = "A", "B"
+    path_a = path_b = None
+
+    if source_mode == "upload":
+        u1, u2 = st.columns(2)
+        with u1:
+            f_a = st.file_uploader("Sample A", type=["mp3", "wav", "flac", "ogg", "m4a"], key="for_a")
+        with u2:
+            f_b = st.file_uploader("Sample B", type=["mp3", "wav", "flac", "ogg", "m4a"], key="for_b")
+        if f_a is not None:
+            path_a = save_temp_upload(f_a.getvalue(), f_a.name)
+            label_a = f_a.name
+            st.audio(f_a.getvalue())
+        if f_b is not None:
+            path_b = save_temp_upload(f_b.getvalue(), f_b.name)
+            label_b = f_b.name
+            st.audio(f_b.getvalue())
+    else:
+        analysis = st.session_state.get("analysis")
+        if analysis is None or not analysis.get("events") or analysis.get("y") is None:
+            st.warning("Run a **track analysis** first (or load a session with audio), then pick two events.")
+            return
+        events = analysis["events"]
+        labels = [
+            f"{e.get('sound_class_icon', '')} {e['id']} · {e.get('sound_class', '?')} · {e.get('note') or '—'}"
+            for e in events
+        ]
+        id_by_label = {lab: e["id"] for lab, e in zip(labels, events)}
+        e1, e2 = st.columns(2)
+        with e1:
+            pick_a = st.selectbox("Event A", options=labels, key="for_ev_a")
+        with e2:
+            pick_b = st.selectbox("Event B", options=labels, index=min(1, len(labels) - 1), key="for_ev_b")
+        sr = int(analysis.get("sr") or 44100)
+        y = analysis["y"]
+        ev_a = next(e for e in events if e["id"] == id_by_label[pick_a])
+        ev_b = next(e for e in events if e["id"] == id_by_label[pick_b])
+        y_a = extract_event_audio(y, sr, ev_a)
+        y_b = extract_event_audio(y, sr, ev_b)
+        label_a, label_b = ev_a["id"], ev_b["id"]
+        st.audio(y_a, sample_rate=sr)
+        st.audio(y_b, sample_rate=sr)
+
+    run = st.button("▶ Run forensics comparison", type="primary", use_container_width=True)
+
+    if run:
+        try:
+            with st.spinner("Extracting forensic profiles + scoring…"):
+                if source_mode == "upload":
+                    if not path_a or not path_b:
+                        st.error("Upload **both** Sample A and Sample B.")
+                        return
+                    result = compare_files(
+                        path_a, path_b, mode=mode, settings=settings, language=language
+                    )
+                    # Fix labels from filenames
+                    result["profile_a"]["label"] = label_a
+                    result["profile_b"]["label"] = label_b
+                    result["report"] = result["report"]  # already generated; regenerate with labels
+                    from aether.forensics import write_analysis_report
+
+                    result["report"] = write_analysis_report(result, language=language)
+                else:
+                    result = compare_audio_arrays(
+                        y_a,
+                        y_b,
+                        sr,
+                        label_a=label_a,
+                        label_b=label_b,
+                        mode=mode,
+                        settings=settings,
+                        language=language,
+                    )
+            st.session_state.forensics_result = result
+        except Exception as exc:
+            st.error(f"Forensics failed: {exc}")
+            return
+        finally:
+            # Cleanup temp uploads
+            for p in (path_a, path_b):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+    result = st.session_state.get("forensics_result")
+    if not result:
+        st.info(
+            "Upload two clips (or pick two events) and run comparison. "
+            "You’ll get a **0–100%** score, dimension breakdown, and a written report."
+        )
+        return
+
+    score = result["score_pct"]
+    st.markdown(f"### Score: `{score:.1f}%`")
+    st.markdown(f"**{result['verdict']}**")
+
+    g1, g2 = st.columns([1, 1.2])
+    with g1:
+        st.plotly_chart(
+            forensics_score_gauge(score, title=f"{result.get('mode', 'sound').title()} match"),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+    with g2:
+        st.plotly_chart(
+            forensics_dimension_bars(result.get("dimensions") or {}),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+
+    st.markdown("#### Written analysis")
+    st.code(result.get("report") or "", language="text")
+    st.download_button(
+        "Download report (.txt)",
+        data=(result.get("report") or "").encode("utf-8"),
+        file_name="aether_forensics_report.txt",
+        mime="text/plain",
+        key="dl_forensics_txt",
+    )
+    # JSON without huge mel arrays if needed — keep as is
+    light = {
+        "score_pct": result["score_pct"],
+        "verdict": result["verdict"],
+        "mode": result["mode"],
+        "dimensions": result["dimensions"],
+        "profile_a": {
+            k: v
+            for k, v in (result.get("profile_a") or {}).items()
+            if k not in ("mel_mean", "mfcc_matrix", "pitch_contour")
+        },
+        "profile_b": {
+            k: v
+            for k, v in (result.get("profile_b") or {}).items()
+            if k not in ("mel_mean", "mfcc_matrix", "pitch_contour")
+        },
+        "report": result.get("report"),
+    }
+    st.download_button(
+        "Download forensics JSON",
+        data=json.dumps(light, indent=2).encode("utf-8"),
+        file_name="aether_forensics.json",
+        mime="application/json",
+        key="dl_forensics_json",
+    )
+
+    with st.expander("Dimension comments"):
+        for key, dim in (result.get("dimensions") or {}).items():
+            st.markdown(f"**{key}** — `{dim.get('pct', 0):.1f}%`  \n{dim.get('comment', '')}")
+
+
 def render_resonance_panel(analysis: dict, selected_id: Optional[str]) -> None:
     resonance = analysis.get("resonance")
     if not resonance:
@@ -766,6 +963,16 @@ def main() -> None:
 
     # ----- Sidebar -----
     with st.sidebar:
+        app_mode = st.radio(
+            "Workspace",
+            options=["track", "forensics"],
+            format_func=lambda x: "🎚 Track analyzer" if x == "track" else "🔍 Forensics compare",
+            horizontal=False,
+            key="app_mode_radio",
+        )
+        st.session_state.app_mode = app_mode
+        st.markdown("---")
+
         st.markdown("### Analyze New Track")
         uploaded = st.file_uploader(
             "Drop MP3 / WAV / FLAC",
@@ -845,9 +1052,19 @@ def main() -> None:
             "Limitations: HPSS ≠ neural stems · "
             "Event detection imperfect on dense mixes · "
             "Classification & presets are rule-based heuristics · "
-            "Similarity / resonance are feature-based, not AI. · "
+            "Similarity / resonance / forensics are feature-based, not AI. · "
             "Install help: SETUP.md"
         )
+
+    # ----- Forensics workspace (independent of full track analysis) -----
+    if st.session_state.get("app_mode") == "forensics":
+        # settings may only exist if sidebar ran advanced block — rebuild defaults
+        try:
+            _settings = settings
+        except NameError:
+            _settings = AnalysisSettings()
+        render_forensics_page(_settings)
+        return
 
     # ----- Run analysis -----
     if run_btn:
