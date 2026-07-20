@@ -1,3 +1,2 @@
-# Apt packages for Streamlit Community Cloud
 ffmpeg
 libsndfile1
