@@ -39,3 +39,7 @@ temp/
 # Optional local test media (keep repo light)
 # *.wav
 # *.mp3
+
+logs-*.txt
+*.log
+
