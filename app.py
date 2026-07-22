@@ -89,7 +89,7 @@ DARK_CSS = f"""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
-    html, body, [class*="css"] {{
+    html, body, .stApp {{
         font-family: 'IBM Plex Sans', system-ui, sans-serif;
     }}
 
@@ -280,12 +280,24 @@ DARK_CSS = f"""
         border-right: 1px solid {COLORS['border']};
     }}
 
+    /* Do NOT hide header — Streamlit 1.39+ puts the app shell there;
+       visibility:hidden on header causes a blank white screen. */
     #MainMenu {{ visibility: hidden; }}
     footer {{ visibility: hidden; }}
-    header {{ visibility: hidden; }}
+    header[data-testid="stHeader"] {{
+        background: transparent;
+    }}
 
     div[data-testid="stMetricValue"] {{
         font-family: 'IBM Plex Mono', monospace;
+    }}
+
+    /* Ensure main block is visible above dark background */
+    .block-container {{
+        padding-top: 1.5rem;
+    }}
+    [data-testid="stAppViewContainer"] {{
+        background: transparent;
     }}
 </style>
 """
