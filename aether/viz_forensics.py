@@ -212,6 +212,77 @@ def forensics_spectrogram_pair(
     return fig
 
 
+def voice_character_summary_bars(char: dict[str, Any]) -> go.Figure:
+    """Horizontal bars for key measurable voice/prosody stats (normalized display)."""
+    m = char.get("measurements") or {}
+    items = [
+        ("f0 mean (Hz)", m.get("f0_mean_hz") or 0, 400),
+        ("f0 range (st)", m.get("f0_range_semitones") or 0, 20),
+        ("centroid (Hz)", (m.get("spectral_centroid_hz") or 0) / 10, 400),  # scale for display
+        ("peaks/sec", m.get("energy_peaks_per_sec") or 0, 8),
+        ("pause frac ×100", (m.get("pause_fraction") or 0) * 100, 100),
+        ("voiced %", (m.get("voiced_ratio") or 0) * 100, 100),
+    ]
+    labels = [i[0] for i in items]
+    vals = [float(i[1]) for i in items]
+    fig = go.Figure(
+        go.Bar(
+            x=vals,
+            y=labels,
+            orientation="h",
+            marker_color=COLORS["accent"],
+            text=[f"{v:.1f}" for v in vals],
+            textposition="auto",
+        )
+    )
+    fig.update_layout(
+        title=dict(
+            text=f"Key measures — {str(char.get('label') or '')[:40]}",
+            font=dict(size=13, color=COLORS["text"]),
+        ),
+        paper_bgcolor=COLORS["surface"],
+        plot_bgcolor=COLORS["surface2"],
+        font=dict(color=COLORS["text"], size=11),
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(gridcolor=COLORS["border"], title="value (mixed units — see report)"),
+        height=280,
+        margin=dict(l=10, r=20, t=40, b=30),
+    )
+    return fig
+
+
+def voice_character_pitch_figure(char: dict[str, Any]) -> go.Figure:
+    times = char.get("pitch_times") or []
+    vals = char.get("pitch_contour_plot") or []
+    xs, ys = [], []
+    for t, v in zip(times, vals):
+        if v is not None and v > 0:
+            xs.append(t)
+            ys.append(v)
+    fig = go.Figure()
+    if xs:
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                name="f0",
+                line=dict(color=COLORS["accent2"], width=1.5),
+            )
+        )
+    fig.update_layout(
+        title=dict(text="Pitch contour (prosody)", font=dict(size=13, color=COLORS["text"])),
+        paper_bgcolor=COLORS["surface"],
+        plot_bgcolor=COLORS["surface2"],
+        font=dict(color=COLORS["text"]),
+        xaxis=dict(title="Time (s)", gridcolor=COLORS["border"], color=COLORS["muted"]),
+        yaxis=dict(title="Hz", gridcolor=COLORS["border"], color=COLORS["muted"]),
+        height=260,
+        margin=dict(l=50, r=20, t=40, b=40),
+    )
+    return fig
+
+
 def forensics_ranking_bars(rankings: list[dict]) -> go.Figure:
     labels = [r["label"][:28] for r in rankings]
     scores = [r["score_pct"] for r in rankings]

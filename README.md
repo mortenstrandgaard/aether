@@ -18,7 +18,8 @@ Classical DSP audio dissection for electronic music producers.
 7. **Classify** each event (Kick, Lead, Pad, …) with rule-based logic
 8. **Preset dump** — Serum/Vital-style text parameters from features
 9. **Resonance Map** — which events lock together (0–100% scores)
-10. **Forensics v2** — compare speech/sounds → **match %** + **reliability %** + spectrograms/pitch + 1-vs-N ranking + written report (classical DSP; works on ordinary *tale*)
+10. **Forensics v2** — compare speech/sounds → **match %** + **reliability %** + spectrograms/pitch + 1-vs-N ranking  
+11. **Voice characteristics** — voice quality + prosody/stemmeføring cards (acoustic only — **not** personality)
 11. **Search** your sample library with MFCC + spectral cosine similarity (optional DTW)
 12. **Export** JSON, MIDI, individual event WAVs, or a full ZIP
 

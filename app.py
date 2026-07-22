@@ -51,6 +51,11 @@ from aether.resonance import resonance_for_event
 from aether.session_io import load_session_zip, save_session_zip
 from aether.similarity import find_similar, index_library
 from aether.sound_dna import format_dna_display
+from aether.voice_character import (
+    analyze_voice_character,
+    analyze_voice_character_file,
+    compare_voice_characters,
+)
 from aether.viz import (
     hpss_figure,
     mfcc_bar_figure,
@@ -65,6 +70,8 @@ from aether.viz_forensics import (
     forensics_reliability_bar,
     forensics_score_gauge,
     forensics_spectrogram_pair,
+    voice_character_pitch_figure,
+    voice_character_summary_bars,
 )
 
 # ---------------------------------------------------------------------------
@@ -304,6 +311,8 @@ def _init_state() -> None:
         "app_mode": "track",
         "forensics_result": None,
         "forensics_ranking": None,
+        "voice_char_result": None,
+        "voice_char_compare": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -758,17 +767,16 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
     Forensics v2: A/B or 1-vs-N, speech-ready, trim/normalize/reliability,
     spectrogram + pitch, written report.
     """
-    st.markdown("## ◈ Forensics — sounds, voices & ordinary speech")
+    st.markdown("## ◈ Forensics — sounds, voices & speech characteristics")
     st.caption(
-        "Classical DSP (MFCC, pitch, spectral, envelope, DTW). "
-        "**Voice mode works on normal speech (tale)** — same words not required. "
-        "Not court-grade speaker ID."
+        "Classical DSP only. **Characteristics ≠ personality.** "
+        "Not court-grade speaker ID. Match scores, voice quality, and prosody are acoustic descriptions."
     )
 
     c1, c2, c3 = st.columns(3)
     with c1:
         mode = st.radio(
-            "Compare mode",
+            "Compare mode (A/B & lineup)",
             options=["voice", "sound"],
             format_func=lambda x: (
                 "Voice / speech (tale)" if x == "voice" else "General sound / sample"
@@ -787,25 +795,228 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
     with c3:
         workflow = st.radio(
             "Workflow",
-            options=["pair", "lineup"],
-            format_func=lambda x: (
-                "A vs B" if x == "pair" else "1 reference vs many"
-            ),
+            options=["character", "pair", "lineup"],
+            format_func=lambda x: {
+                "character": "Voice characteristics",
+                "pair": "A vs B match",
+                "lineup": "1 ref vs many",
+            }[x],
             horizontal=True,
             key="forensics_workflow",
         )
 
-    with st.expander("Tips for ordinary speech (tale)", expanded=False):
+    with st.expander("Tips + scope (tale / characteristics)", expanded=False):
         st.markdown(
             """
-- Brug **Voice / speech** mode  
-- **≥ 3 sekunder** tør tale pr. klip (5–10 sek er bedre)  
-- I behøver **ikke** sige de samme ord — vi måler klang/pitch, ikke indhold  
-- Samme telefon/rum giver renere scores; forskellig mic sænker ofte scoren  
-- Baggrundsmusik og støj sænker **reliability**  
-- Lav **DTW/temporal** er normalt når teksten er forskellig — kig på **timbre + pitch**
+**Match (A vs B / lineup)**  
+- Voice mode virker på almindelig tale — samme ord er **ikke** nødvendige  
+- ≥ 3–5 sek tør tale; reliability falder på støj/korte klip  
+
+**Voice characteristics**  
+- **Voice quality** = hvordan instrumentet lyder (f0, klang, voicing, formant-proxies)  
+- **Prosody / stemmeføring** = hvordan det bruges over tid (melodi, rate, pauser, dynamik)  
+- **Ingen personlighed, ingen diagnose, ingen juridisk ID** — kun akustiske beskrivelser  
+- Formanter og “talehastighed” er klassiske **proxies**, ikke lab-faciliteter  
             """
         )
+
+    # ----- Voice characteristics (single or dual card) -----
+    if workflow == "character":
+        st.markdown("#### Voice characteristics (quality + prosody)")
+        st.caption(
+            "Acoustic character card only — not personality. "
+            "Optional second file for descriptive side-by-side comparison."
+        )
+        u1, u2 = st.columns(2)
+        with u1:
+            f_a = st.file_uploader(
+                "Primary speech clip (A)",
+                type=["mp3", "wav", "flac", "ogg", "m4a"],
+                key="vchar_a",
+            )
+        with u2:
+            f_b = st.file_uploader(
+                "Optional clip B (compare characteristics)",
+                type=["mp3", "wav", "flac", "ogg", "m4a"],
+                key="vchar_b",
+            )
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            start_c = st.number_input("Start (s)", 0.0, 600.0, 0.0, 0.1, key="vchar_start")
+        with col_s2:
+            end_c = st.number_input("End (s, 0=full)", 0.0, 600.0, 0.0, 0.1, key="vchar_end")
+        end_c_v = None if end_c <= 0 else float(end_c)
+
+        if st.button("▶ Analyse characteristics", type="primary", use_container_width=True):
+            if f_a is None:
+                st.error("Upload at least primary clip A.")
+            else:
+                paths = []
+                try:
+                    with st.spinner("Extracting voice quality + prosody…"):
+                        p_a = save_temp_upload(f_a.getvalue(), f_a.name)
+                        paths.append(p_a)
+                        char_a = analyze_voice_character_file(
+                            p_a,
+                            label=f_a.name,
+                            settings=settings,
+                            language=language,
+                            start_sec=float(start_c),
+                            end_sec=end_c_v,
+                        )
+                        st.session_state.voice_char_result = char_a
+                        st.session_state.voice_char_compare = None
+                        if f_b is not None:
+                            p_b = save_temp_upload(f_b.getvalue(), f_b.name)
+                            paths.append(p_b)
+                            char_b = analyze_voice_character_file(
+                                p_b,
+                                label=f_b.name,
+                                settings=settings,
+                                language=language,
+                                start_sec=float(start_c),
+                                end_sec=end_c_v,
+                            )
+                            st.session_state.voice_char_compare = compare_voice_characters(
+                                char_a, char_b, language=language
+                            )
+                            # keep both cards in compare payload
+                            st.session_state.voice_char_result = char_a
+                            st.session_state["_voice_char_b"] = char_b
+                except Exception as exc:
+                    st.error(f"Characteristics failed: {exc}")
+                finally:
+                    for p in paths:
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+        char = st.session_state.get("voice_char_result")
+        if not char:
+            st.info(
+                "Upload a speech clip (≥4–8s recommended). "
+                "You’ll get a **voice quality** card + **prosody** card + written report."
+            )
+            return
+
+        rel = char.get("reliability") or {}
+        st.markdown(
+            f"### `{char.get('label')}`  ·  Reliability `{rel.get('reliability_pct', '—')}%`"
+        )
+        st.caption(rel.get("label") or "")
+        st.warning(char.get("disclaimer") or "Acoustic characteristics only — not personality.")
+
+        vq = char.get("voice_quality") or {}
+        pr = char.get("prosody") or {}
+        cqa, cqb = st.columns(2)
+        with cqa:
+            st.markdown("##### 1. Voice quality")
+            st.markdown(f"- **Pitch register:** {vq.get('pitch_register', '—')}")
+            st.markdown(f"- **Voicing:** {vq.get('voicing', '—')}")
+            st.markdown(f"- **Spectral colour:** {vq.get('spectral_colour', '—')}")
+            m = char.get("measurements") or {}
+            f = m.get("formants") or {}
+            st.markdown(
+                f"- **f0 mean:** {m.get('f0_mean_hz') or '—'} Hz  ·  "
+                f"**range:** {m.get('f0_range_semitones', 0):.1f} st"
+            )
+            st.markdown(
+                f"- **Formants (proxy):** F1={f.get('f1_hz') or '—'}  "
+                f"F2={f.get('f2_hz') or '—'}  F3={f.get('f3_hz') or '—'} Hz"
+            )
+            st.markdown(
+                f"- **HNR proxy:** {m.get('hnr_proxy_db') if m.get('hnr_proxy_db') is not None else '—'} dB"
+            )
+        with cqb:
+            st.markdown("##### 2. Prosody / stemmeføring")
+            st.markdown(f"- **Pitch variability:** {pr.get('pitch_variability', '—')}")
+            st.markdown(f"- **Delivery rate:** {pr.get('delivery_rate', '—')}")
+            st.markdown(f"- **Pausing:** {pr.get('pausing', '—')}")
+            st.markdown(f"- **Dynamics:** {pr.get('dynamics', '—')}")
+            st.markdown(
+                f"- **Energy peaks/sec:** {m.get('energy_peaks_per_sec', 0)}  ·  "
+                f"**pause frac:** {m.get('pause_fraction', 0):.2f}"
+            )
+
+        g1, g2 = st.columns(2)
+        with g1:
+            st.plotly_chart(
+                voice_character_summary_bars(char),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+        with g2:
+            st.plotly_chart(
+                voice_character_pitch_figure(char),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+        if char.get("y_plot") is not None:
+            try:
+                st.plotly_chart(
+                    forensics_spectrogram_pair(
+                        {
+                            "label": char.get("label"),
+                            "y_plot": char["y_plot"],
+                            "sample_rate": char.get("sample_rate"),
+                        },
+                        {
+                            "label": "—",
+                            "y_plot": char["y_plot"][:1],
+                            "sample_rate": char.get("sample_rate"),
+                        },
+                        sr=int(char.get("sample_rate") or 44100),
+                    ),
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+
+        st.markdown("#### Written report")
+        st.code(char.get("report") or "", language="text")
+        st.download_button(
+            "Download characteristics report (.txt)",
+            data=(char.get("report") or "").encode("utf-8"),
+            file_name="aether_voice_characteristics.txt",
+            mime="text/plain",
+            key="dl_vchar_txt",
+            use_container_width=True,
+        )
+
+        cmp = st.session_state.get("voice_char_compare")
+        char_b = st.session_state.get("_voice_char_b")
+        if cmp and char_b:
+            st.markdown("---")
+            st.markdown("#### Side-by-side characteristics (A vs B)")
+            st.code(cmp.get("report") or "", language="text")
+            b1, b2 = st.columns(2)
+            with b1:
+                st.markdown(f"**A — {char.get('label')}**")
+                st.plotly_chart(
+                    voice_character_pitch_figure(char),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+            with b2:
+                st.markdown(f"**B — {char_b.get('label')}**")
+                st.plotly_chart(
+                    voice_character_pitch_figure(char_b),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+            for bullet in cmp.get("bullets") or []:
+                st.markdown(f"- {bullet}")
+            st.download_button(
+                "Download comparison report (.txt)",
+                data=(cmp.get("report") or "").encode("utf-8"),
+                file_name="aether_voice_char_compare.txt",
+                mime="text/plain",
+                key="dl_vchar_cmp",
+                use_container_width=True,
+            )
+        return
 
     # ----- 1-vs-N lineup -----
     if workflow == "lineup":
