@@ -51,8 +51,20 @@ from aether.resonance import resonance_for_event
 from aether.session_io import load_session_zip, save_session_zip
 from aether.similarity import find_similar, index_library
 from aether.sound_dna import format_dna_display
+from aether.explain import (
+    explain_score_snapshot,
+    render_dimension_help_markdown,
+    render_voice_guide_markdown,
+)
+from aether.mixer import (
+    LAYER_LABELS,
+    build_layers,
+    mix_layers,
+    mix_to_wav_bytes,
+    slice_layer,
+)
+from aether.pitch_forensics import build_pitch_forensics
 from aether.voice_character import (
-    analyze_voice_character,
     analyze_voice_character_file,
     compare_voice_characters,
 )
@@ -73,6 +85,7 @@ from aether.viz_forensics import (
     voice_character_pitch_figure,
     voice_character_summary_bars,
 )
+from aether.viz_pitch import pitch_lane_figure
 
 # ---------------------------------------------------------------------------
 # Page config & dark theme
@@ -325,6 +338,13 @@ def _init_state() -> None:
         "forensics_ranking": None,
         "voice_char_result": None,
         "voice_char_compare": None,
+        "pitch_forensics": None,
+        "mixer_enabled": {
+            "full": False,
+            "harmonic": True,
+            "percussive": True,
+            "residual": False,
+        },
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -831,6 +851,9 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
 - Formanter og “talehastighed” er klassiske **proxies**, ikke lab-faciliteter  
             """
         )
+    with st.expander("Explain: age / training / intervention / scores", expanded=False):
+        st.markdown(render_voice_guide_markdown(language))
+        st.markdown(render_dimension_help_markdown())
 
     # ----- Voice characteristics (single or dual card) -----
     if workflow == "character":
@@ -996,6 +1019,26 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
             key="dl_vchar_txt",
             use_container_width=True,
         )
+
+        st.markdown("#### Pitch lane (note grid + correction heuristics)")
+        if st.button("Run pitch-forensics on this clip", use_container_width=True, key="vchar_pitch"):
+            try:
+                y_pf = char.get("y_plot")
+                sr_pf = int(char.get("sample_rate") or 44100)
+                if y_pf is None:
+                    st.error("No audio buffer on character result.")
+                else:
+                    with st.spinner("Building pitch lane…"):
+                        st.session_state.pitch_forensics = build_pitch_forensics(
+                            y_pf, sr_pf, label=str(char.get("label") or "clip")
+                        )
+            except Exception as exc:
+                st.error(str(exc))
+        if st.session_state.get("pitch_forensics"):
+            render_pitch_forensics_block(st.session_state.pitch_forensics)
+
+        with st.expander("What can change with age / training / tech?"):
+            st.markdown(render_voice_guide_markdown(language))
 
         cmp = st.session_state.get("voice_char_compare")
         char_b = st.session_state.get("_voice_char_b")
@@ -1285,6 +1328,16 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
     st.markdown(f"**{result['verdict']}**")
     st.caption(rel.get("label") or "")
 
+    with st.expander("What does this score mean?", expanded=True):
+        st.markdown(
+            explain_score_snapshot(
+                result.get("dimensions") or {},
+                float(score),
+                float(rel.get("reliability_pct") or 0),
+            )
+        )
+        st.markdown(render_dimension_help_markdown())
+
     g1, g2 = st.columns(2)
     with g1:
         st.plotly_chart(
@@ -1358,6 +1411,155 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
             st.markdown(
                 f"**{key}** — `{dim.get('pct', 0):.1f}%`  \n{dim.get('comment', '')}"
             )
+
+
+def render_mixer_panel(analysis: dict) -> None:
+    """Play / solo-style mute / export HPSS layers (classical, not neural stems)."""
+    st.markdown("#### Layer mixer (HPSS)")
+    st.caption(
+        "Not neural stems — **Harmonic / Percussive / Residual** from classical HPSS. "
+        "Harmonic is the closest 'song/melody/vocal-ish' layer for forensics export."
+    )
+    try:
+        layers = build_layers(analysis)
+    except Exception as exc:
+        st.warning(f"Mixer unavailable: {exc}")
+        return
+
+    sr = int(analysis.get("sr") or 44100)
+    dur = len(layers["full"]) / sr
+
+    st.markdown("**Enable layers** (when mixing parts, Full is ignored to avoid double-count)")
+    cols = st.columns(4)
+    enabled = dict(st.session_state.get("mixer_enabled") or {})
+    for i, key in enumerate(("full", "harmonic", "percussive", "residual")):
+        with cols[i]:
+            enabled[key] = st.checkbox(
+                LAYER_LABELS[key].split("(")[0].strip(),
+                value=enabled.get(key, key != "full" and key != "residual"),
+                key=f"mix_en_{key}",
+                help=LAYER_LABELS[key],
+            )
+    st.session_state.mixer_enabled = enabled
+
+    # Solo shortcuts
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        if st.button("Solo full", use_container_width=True):
+            st.session_state.mixer_enabled = {
+                "full": True, "harmonic": False, "percussive": False, "residual": False
+            }
+            st.rerun()
+    with s2:
+        if st.button("Solo harmonic", use_container_width=True):
+            st.session_state.mixer_enabled = {
+                "full": False, "harmonic": True, "percussive": False, "residual": False
+            }
+            st.rerun()
+    with s3:
+        if st.button("Solo percussive", use_container_width=True):
+            st.session_state.mixer_enabled = {
+                "full": False, "harmonic": False, "percussive": True, "residual": False
+            }
+            st.rerun()
+    with s4:
+        if st.button("Harm+Perc", use_container_width=True):
+            st.session_state.mixer_enabled = {
+                "full": False, "harmonic": True, "percussive": True, "residual": False
+            }
+            st.rerun()
+
+    enabled = st.session_state.mixer_enabled
+    use_full_only = bool(enabled.get("full")) and not any(
+        enabled.get(k) for k in ("harmonic", "percussive", "residual")
+    )
+    mix = mix_layers(layers, enabled=enabled, use_full_only=use_full_only)
+    st.audio(mix, sample_rate=sr)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start = st.number_input("Export start (s)", 0.0, float(dur), 0.0, 0.1, key="mix_exp_s")
+    with c2:
+        end = st.number_input("Export end (s, 0=full)", 0.0, float(max(dur, 0.1)), 0.0, 0.1, key="mix_exp_e")
+    with c3:
+        end_v = None if end <= 0 else float(end)
+        clip = slice_layer(mix, sr, float(start), end_v)
+        wav_b = mix_to_wav_bytes(clip, sr)
+        st.download_button(
+            "Download mix WAV",
+            data=wav_b,
+            file_name="aether_mix.wav",
+            mime="audio/wav",
+            use_container_width=True,
+            key="dl_mix_wav",
+        )
+
+    # Export harmonic alone + open pitch forensics path
+    st.markdown("##### Send layer to pitch forensics")
+    st.caption("Export harmonic (or current mix) then analyse pitch grid / autotune heuristics.")
+    pf1, pf2 = st.columns(2)
+    with pf1:
+        if st.button("Pitch-forensics on **harmonic** layer", use_container_width=True):
+            try:
+                with st.spinner("Pitch lane + correction heuristics…"):
+                    y_h = slice_layer(layers["harmonic"], sr, float(start), end_v if end > 0 else None)
+                    st.session_state.pitch_forensics = build_pitch_forensics(
+                        y_h, sr, label="harmonic_layer"
+                    )
+                st.success("Pitch forensics ready — see panel below.")
+            except Exception as exc:
+                st.error(str(exc))
+    with pf2:
+        if st.button("Pitch-forensics on **current mix**", use_container_width=True):
+            try:
+                with st.spinner("Pitch lane + correction heuristics…"):
+                    st.session_state.pitch_forensics = build_pitch_forensics(
+                        clip, sr, label="current_mix"
+                    )
+                st.success("Pitch forensics ready — see panel below.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    pf = st.session_state.get("pitch_forensics")
+    if pf:
+        render_pitch_forensics_block(pf)
+
+
+def render_pitch_forensics_block(pf: dict) -> None:
+    corr = pf.get("correction") or {}
+    st.markdown("#### Pitch lane + correction evidence")
+    st.markdown(
+        f"**{corr.get('correction_likelihood_pct', 0)}%** quantisation/correction likelihood — "
+        f"*{corr.get('label', '')}*"
+    )
+    st.caption(corr.get("disclaimer") or "")
+    st.plotly_chart(
+        pitch_lane_figure(pf),
+        use_container_width=True,
+        config={
+            "displayModeBar": True,
+            "scrollZoom": True,
+            "modeBarButtonsToAdd": ["drawline2d"],
+        },
+    )
+    with st.expander("Evidence list + metrics", expanded=True):
+        for e in corr.get("evidence") or []:
+            st.markdown(f"- {e}")
+        st.json(corr.get("metrics") or {})
+    st.download_button(
+        "Download pitch-forensics JSON",
+        data=json.dumps(
+            {
+                "label": pf.get("label"),
+                "correction": corr,
+                "note_grid_count": len(pf.get("note_grid") or []),
+            },
+            indent=2,
+        ).encode("utf-8"),
+        file_name="aether_pitch_forensics.json",
+        mime="application/json",
+        key="dl_pitch_for",
+    )
 
 
 def render_resonance_panel(analysis: dict, selected_id: Optional[str]) -> None:
@@ -1607,13 +1809,19 @@ def main() -> None:
             st.session_state.selected_event_id = label_to_id[chosen]
             selected_id = st.session_state.selected_event_id
 
-        tab_tl, tab_spec, tab_hpss, tab_res = st.tabs(
-            ["Timeline", "Spectrogram", "HPSS", "Resonance Map"]
+        tab_tl, tab_spec, tab_hpss, tab_mix, tab_res = st.tabs(
+            ["Timeline", "Spectrogram", "HPSS", "Mixer", "Resonance Map"]
         )
 
         color_mode = st.session_state.get("timeline_color_mode", "sound_class")
 
         with tab_tl:
+            # Full-track playback
+            y_full = analysis.get("y")
+            sr_full = int(analysis.get("sr") or 44100)
+            if y_full is not None:
+                st.caption("Full track (analysis mono)")
+                st.audio(y_full, sample_rate=sr_full)
             fig = timeline_figure(
                 analysis, selected_id=selected_id, color_mode=color_mode
             )
@@ -1643,6 +1851,9 @@ def main() -> None:
                 st.plotly_chart(hpss_figure(yh, yp, sr), use_container_width=True)
             else:
                 st.warning("HPSS buffers not available.")
+
+        with tab_mix:
+            render_mixer_panel(analysis)
 
         with tab_res:
             render_resonance_panel(analysis, selected_id)
