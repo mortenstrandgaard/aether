@@ -1,9 +1,13 @@
 [server]
 headless = true
+port = 5179
+address = "localhost"
 maxUploadSize = 50
 
 [browser]
 gatherUsageStats = false
+serverAddress = "localhost"
+serverPort = 5179
 
 [theme]
 base = "dark"
