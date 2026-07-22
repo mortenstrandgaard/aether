@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import streamlit as st
 
 from aether import __version__
@@ -64,6 +65,7 @@ from aether.mixer import (
     slice_layer,
 )
 from aether.pitch_forensics import build_pitch_forensics
+from aether.pitch_scrubber import prepare_scrubber_payload, render_pitch_scrubber
 from aether.voice_character import (
     analyze_voice_character_file,
     compare_voice_characters,
@@ -339,6 +341,7 @@ def _init_state() -> None:
         "voice_char_result": None,
         "voice_char_compare": None,
         "pitch_forensics": None,
+        "scrubber_payload": None,
         "mixer_enabled": {
             "full": False,
             "harmonic": True,
@@ -1020,7 +1023,7 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
             use_container_width=True,
         )
 
-        st.markdown("#### Pitch lane (note grid + correction heuristics)")
+        st.markdown("#### Pitch lane + audio-sync scrubber")
         if st.button("Run pitch-forensics on this clip", use_container_width=True, key="vchar_pitch"):
             try:
                 y_pf = char.get("y_plot")
@@ -1028,9 +1031,13 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
                 if y_pf is None:
                     st.error("No audio buffer on character result.")
                 else:
-                    with st.spinner("Building pitch lane…"):
+                    with st.spinner("Building pitch lane + scrubber…"):
+                        lab = str(char.get("label") or "clip")
                         st.session_state.pitch_forensics = build_pitch_forensics(
-                            y_pf, sr_pf, label=str(char.get("label") or "clip")
+                            y_pf, sr_pf, label=lab
+                        )
+                        st.session_state.scrubber_payload = prepare_scrubber_payload(
+                            y_pf, sr_pf, label=lab
                         )
             except Exception as exc:
                 st.error(str(exc))
@@ -1414,11 +1421,11 @@ def render_forensics_page(settings: AnalysisSettings) -> None:
 
 
 def render_mixer_panel(analysis: dict) -> None:
-    """Play / solo-style mute / export HPSS layers (classical, not neural stems)."""
+    """Play / solo-style mute / export HPSS layers with optional event region."""
     st.markdown("#### Layer mixer (HPSS)")
     st.caption(
         "Not neural stems — **Harmonic / Percussive / Residual** from classical HPSS. "
-        "Harmonic is the closest 'song/melody/vocal-ish' layer for forensics export."
+        "**Event region** = only the time window of a detected event (A-00N)."
     )
     try:
         layers = build_layers(analysis)
@@ -1427,7 +1434,85 @@ def render_mixer_panel(analysis: dict) -> None:
         return
 
     sr = int(analysis.get("sr") or 44100)
-    dur = len(layers["full"]) / sr
+    dur = float(len(layers["full"]) / sr)
+    events = analysis.get("events") or []
+
+    # ----- Event region -----
+    st.markdown("##### Event region")
+    st.caption(
+        "Full track = hele analysen. Ellers vælg et event — play/export/forensics "
+        "bruger kun **start→end** for det event."
+    )
+    region_options = ["Full track"]
+    region_map: dict[str, tuple[float, Optional[float]]] = {
+        "Full track": (0.0, None),
+    }
+    for ev in events:
+        lab = (
+            f"{ev.get('sound_class_icon', '')} {ev['id']} · "
+            f"{ev.get('sound_class', '?')} · "
+            f"{ev['start_time']:.2f}–{ev['end_time']:.2f}s"
+        )
+        region_options.append(lab)
+        region_map[lab] = (float(ev["start_time"]), float(ev["end_time"]))
+
+    # Default to selected event if any
+    default_idx = 0
+    sel_id = st.session_state.get("selected_event_id")
+    if sel_id:
+        for i, lab in enumerate(region_options):
+            if lab.startswith(" ") and sel_id in lab:
+                default_idx = i
+                break
+            if sel_id in lab:
+                default_idx = i
+                break
+
+    region_lab = st.selectbox(
+        "Region source",
+        options=region_options,
+        index=min(default_idx, len(region_options) - 1),
+        key="mix_region_sel",
+    )
+    reg_start, reg_end = region_map[region_lab]
+    is_event_region = region_lab != "Full track"
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        start = st.number_input(
+            "Region start (s)",
+            0.0,
+            float(max(dur, 0.1)),
+            float(reg_start),
+            0.01,
+            key="mix_exp_s",
+            disabled=is_event_region,
+        )
+    with m2:
+        end_default = 0.0 if reg_end is None else float(reg_end)
+        end = st.number_input(
+            "Region end (s, 0=full track)",
+            0.0,
+            float(max(dur, 0.1)),
+            end_default,
+            0.01,
+            key="mix_exp_e",
+            disabled=is_event_region,
+        )
+    with m3:
+        if is_event_region and reg_end is not None:
+            st.metric("Event length", f"{reg_end - reg_start:.3f}s")
+            start, end_v = float(reg_start), float(reg_end)
+        else:
+            start = float(start)
+            end_v = None if end <= 0 else float(end)
+            st.metric(
+                "Region length",
+                f"{(end_v or dur) - start:.3f}s" if end_v else f"{dur - start:.3f}s+",
+            )
+
+    if is_event_region and reg_end is not None:
+        start, end_v = float(reg_start), float(reg_end)
 
     st.markdown("**Enable layers** (when mixing parts, Full is ignored to avoid double-count)")
     cols = st.columns(4)
@@ -1442,7 +1527,6 @@ def render_mixer_panel(analysis: dict) -> None:
             )
     st.session_state.mixer_enabled = enabled
 
-    # Solo shortcuts
     s1, s2, s3, s4 = st.columns(4)
     with s1:
         if st.button("Solo full", use_container_width=True):
@@ -1473,56 +1557,76 @@ def render_mixer_panel(analysis: dict) -> None:
     use_full_only = bool(enabled.get("full")) and not any(
         enabled.get(k) for k in ("harmonic", "percussive", "residual")
     )
-    mix = mix_layers(layers, enabled=enabled, use_full_only=use_full_only)
-    st.audio(mix, sample_rate=sr)
+    mix_full = mix_layers(layers, enabled=enabled, use_full_only=use_full_only)
+    clip = slice_layer(mix_full, sr, start, end_v)
+    harm_clip = slice_layer(layers["harmonic"], sr, start, end_v)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        start = st.number_input("Export start (s)", 0.0, float(dur), 0.0, 0.1, key="mix_exp_s")
-    with c2:
-        end = st.number_input("Export end (s, 0=full)", 0.0, float(max(dur, 0.1)), 0.0, 0.1, key="mix_exp_e")
-    with c3:
-        end_v = None if end <= 0 else float(end)
-        clip = slice_layer(mix, sr, float(start), end_v)
-        wav_b = mix_to_wav_bytes(clip, sr)
-        st.download_button(
-            "Download mix WAV",
-            data=wav_b,
-            file_name="aether_mix.wav",
-            mime="audio/wav",
-            use_container_width=True,
-            key="dl_mix_wav",
-        )
+    st.markdown(
+        f"**Playback region:** `{start:.3f}s` → "
+        f"`{(end_v if end_v is not None else dur):.3f}s`"
+        + (f" · event `{region_lab.split('·')[0].strip()}`" if is_event_region else "")
+    )
+    st.audio(clip, sample_rate=sr)
 
-    # Export harmonic alone + open pitch forensics path
-    st.markdown("##### Send layer to pitch forensics")
-    st.caption("Export harmonic (or current mix) then analyse pitch grid / autotune heuristics.")
-    pf1, pf2 = st.columns(2)
+    wav_b = mix_to_wav_bytes(clip, sr)
+    region_tag = "event" if is_event_region else "region"
+    st.download_button(
+        "Download region mix WAV",
+        data=wav_b,
+        file_name=f"aether_{region_tag}_mix.wav",
+        mime="audio/wav",
+        use_container_width=True,
+        key="dl_mix_wav",
+    )
+    st.download_button(
+        "Download region **harmonic** WAV",
+        data=mix_to_wav_bytes(harm_clip, sr),
+        file_name=f"aether_{region_tag}_harmonic.wav",
+        mime="audio/wav",
+        use_container_width=True,
+        key="dl_harm_wav",
+    )
+
+    st.markdown("##### Pitch forensics + audio-sync scrubber")
+    st.caption(
+        "Runs on the **selected region** only. Harmonic = closest classical "
+        "'song/melody' isolation for pitch / autotune heuristics."
+    )
+    pf1, pf2, pf3 = st.columns(3)
     with pf1:
-        if st.button("Pitch-forensics on **harmonic** layer", use_container_width=True):
-            try:
-                with st.spinner("Pitch lane + correction heuristics…"):
-                    y_h = slice_layer(layers["harmonic"], sr, float(start), end_v if end > 0 else None)
-                    st.session_state.pitch_forensics = build_pitch_forensics(
-                        y_h, sr, label="harmonic_layer"
-                    )
-                st.success("Pitch forensics ready — see panel below.")
-            except Exception as exc:
-                st.error(str(exc))
+        if st.button("Forensics: **harmonic** region", use_container_width=True, type="primary"):
+            _run_region_pitch_forensics(harm_clip, sr, label=f"harmonic@{start:.2f}s")
     with pf2:
-        if st.button("Pitch-forensics on **current mix**", use_container_width=True):
+        if st.button("Forensics: **mix** region", use_container_width=True):
+            _run_region_pitch_forensics(clip, sr, label=f"mix@{start:.2f}s")
+    with pf3:
+        if st.button("Open scrubber only (mix)", use_container_width=True):
             try:
-                with st.spinner("Pitch lane + correction heuristics…"):
-                    st.session_state.pitch_forensics = build_pitch_forensics(
-                        clip, sr, label="current_mix"
+                with st.spinner("Preparing scrubber…"):
+                    st.session_state.scrubber_payload = prepare_scrubber_payload(
+                        clip, sr, label=f"mix@{start:.2f}s"
                     )
-                st.success("Pitch forensics ready — see panel below.")
+                    st.session_state.pitch_forensics = build_pitch_forensics(
+                        clip, sr, label=f"mix@{start:.2f}s"
+                    )
             except Exception as exc:
                 st.error(str(exc))
 
     pf = st.session_state.get("pitch_forensics")
     if pf:
         render_pitch_forensics_block(pf)
+
+
+def _run_region_pitch_forensics(y: np.ndarray, sr: int, label: str) -> None:
+    try:
+        with st.spinner("Pitch lane + scrubber + correction heuristics…"):
+            st.session_state.pitch_forensics = build_pitch_forensics(y, sr, label=label)
+            st.session_state.scrubber_payload = prepare_scrubber_payload(
+                y, sr, label=label
+            )
+        st.success("Pitch forensics + scrubber ready below.")
+    except Exception as exc:
+        st.error(str(exc))
 
 
 def render_pitch_forensics_block(pf: dict) -> None:
@@ -1533,15 +1637,30 @@ def render_pitch_forensics_block(pf: dict) -> None:
         f"*{corr.get('label', '')}*"
     )
     st.caption(corr.get("disclaimer") or "")
-    st.plotly_chart(
-        pitch_lane_figure(pf),
-        use_container_width=True,
-        config={
-            "displayModeBar": True,
-            "scrollZoom": True,
-            "modeBarButtonsToAdd": ["drawline2d"],
-        },
-    )
+
+    # Audio-sync scrubber (primary interactive view)
+    payload = st.session_state.get("scrubber_payload")
+    if payload and payload.get("audio_b64"):
+        st.markdown("##### Audio-sync scrubber")
+        st.caption(
+            "Playhead follows audio · click to seek · mouse wheel zooms time · "
+            "horizontal lines = equal-tempered notes."
+        )
+        render_pitch_scrubber(payload, height=500, key="mix_scrubber")
+    else:
+        st.plotly_chart(
+            pitch_lane_figure(pf),
+            use_container_width=True,
+            config={"displayModeBar": True, "scrollZoom": True},
+        )
+
+    with st.expander("Static Plotly pitch (extra zoom tools)", expanded=False):
+        st.plotly_chart(
+            pitch_lane_figure(pf),
+            use_container_width=True,
+            config={"displayModeBar": True, "scrollZoom": True},
+        )
+
     with st.expander("Evidence list + metrics", expanded=True):
         for e in corr.get("evidence") or []:
             st.markdown(f"- {e}")
